@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+*.exe
+
+# Node
+node_modules/
+.vite/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Database & Data (contains user API keys)
+*.db
+*.sqlite3
+**/data/
+miho-spot-desktop/app_gui/
+
+# Junk
+$null
+*.dsstored
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+debug*.png
+sidebar_*.png
+
+# PyInstaller
+*.manifest
+warn-*.txt
+
+# Archives
+Archived/
+Novel_Archieved/
+novel_blog/

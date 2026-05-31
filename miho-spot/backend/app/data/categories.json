@@ -1,0 +1,24 @@
+{
+  "categories": {
+    "mihoyo_game": {
+      "name": "米哈游游戏",
+      "order": 1
+    },
+    "mihoyo_character": {
+      "name": "米哈游角色",
+      "order": 2
+    },
+    "mihoyo_cv": {
+      "name": "米哈游CV",
+      "order": 3
+    },
+    "competitor": {
+      "name": "竞品游戏",
+      "order": 4
+    },
+    "general": {
+      "name": "二游圈通用",
+      "order": 5
+    }
+  }
+}
