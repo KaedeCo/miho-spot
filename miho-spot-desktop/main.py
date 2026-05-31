@@ -193,15 +193,20 @@ class BackendGUI(QMainWindow):
         self._poll = QTimer(self); self._poll.timeout.connect(self._check_ready); self._poll.start(2000)
 
     def _run_server(self):
-        # When frozen, redirect data to user's AppData so it persists
+        # When frozen, redirect ALL data to EXE-adjacent folder so it persists
         if getattr(sys, 'frozen', False):
             import app.models as _m
-            base = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "Miho-spot" / "data"
+            base = Path(sys.executable).parent / "data"
             base.mkdir(parents=True, exist_ok=True)
             _m.DATA_DIR = str(base)
             _m.DB_PATH = os.path.join(str(base), "miho_spot.db")
-            # Also redirect tophub_search data
-            os.makedirs(str(base / "tophub_search"), exist_ok=True)
+            # Recreate engine and session bound to the correct DB
+            from sqlalchemy import create_engine
+            from sqlalchemy.orm import sessionmaker
+            _m.engine = create_engine(f"sqlite:///{_m.DB_PATH}", echo=False)
+            _m.SessionLocal = sessionmaker(bind=_m.engine)
+            from app.api.routes import set_data_base_dir
+            set_data_base_dir(str(base))
 
         import uvicorn
         from fastapi import FastAPI

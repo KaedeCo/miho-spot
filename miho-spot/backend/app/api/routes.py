@@ -17,6 +17,23 @@ from app.crawlers import get_crawler
 
 router = APIRouter(prefix="/api")
 
+# Centralized data directory — can be overridden for frozen EXE
+_DATA_BASE_DIR: Optional[str] = None
+
+def set_data_base_dir(path: str):
+    """Override the data base directory (for frozen EXE that can't use __file__)."""
+    global _DATA_BASE_DIR, TOPHUB_SEARCH_DATA_DIR, CATEGORIES_FILE, _DSSTORE_LOCK_FILE
+    _DATA_BASE_DIR = path
+    # Reset cached paths so they re-resolve
+    TOPHUB_SEARCH_DATA_DIR = None
+    CATEGORIES_FILE = None
+    _DSSTORE_LOCK_FILE = None
+
+def _get_data_base() -> Path:
+    if _DATA_BASE_DIR:
+        return Path(_DATA_BASE_DIR)
+    return Path(__file__).resolve().parent.parent / "data"
+
 # Separate caches for hot and search results
 _hot_cache: dict = {"zhihu": [], "douyin": [], "tieba": []}
 _search_cache: dict = {"zhihu": [], "douyin": [], "tieba": []}
@@ -33,7 +50,9 @@ _DSSTORE_LOCK_FILE: Optional[Path] = None
 def _get_dsstore_dir() -> Path:
     global _DSSTORE_LOCK_FILE
     if _DSSTORE_LOCK_FILE is None:
-        _DSSTORE_LOCK_FILE = Path(__file__).resolve().parent.parent / "data" / "tophub_search"
+        d = _get_data_base() / "tophub_search"
+        d.mkdir(parents=True, exist_ok=True)
+        _DSSTORE_LOCK_FILE = d
     return _DSSTORE_LOCK_FILE
 
 
@@ -113,8 +132,11 @@ def _load_hot_crawl_from_file() -> bool:
         with open(hot_file, "r", encoding="utf-8") as f:
             items = json.load(f)
         if items:
-            # Re-analyze to ensure fresh sentiment labels
-            _run_analyze(items)
+            # Keep stored sentiment labels (may include DeepSeek results)
+            # Ensure is_game_related is populated for older files
+            for i in items:
+                if "is_game_related" not in i:
+                    i["is_game_related"] = i.get("sentiment", "Neutral") != "Irrelevant"
             _hot_cache = {}
             for i in items:
                 p = i.get("platform", "other")
@@ -160,8 +182,9 @@ TOPHUB_SEARCH_DATA_DIR: Optional[Path] = None  # Resolved lazily
 def _get_search_data_dir() -> Path:
     global TOPHUB_SEARCH_DATA_DIR
     if TOPHUB_SEARCH_DATA_DIR is None:
-        TOPHUB_SEARCH_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "tophub_search"
-        TOPHUB_SEARCH_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        d = _get_data_base() / "tophub_search"
+        d.mkdir(parents=True, exist_ok=True)
+        TOPHUB_SEARCH_DATA_DIR = d
     return TOPHUB_SEARCH_DATA_DIR
 
 
@@ -208,8 +231,11 @@ def _load_today_search_to_cache() -> bool:
             file_data = json.load(f)
         items = file_data.get("parsed_items", [])
         if items:
-            # Re-run sentiment analysis on loaded items to ensure labels are fresh
-            _run_analyze(items)
+            # Keep stored sentiment labels (may include DeepSeek results)
+            # Ensure is_game_related is populated for older files
+            for i in items:
+                if "is_game_related" not in i:
+                    i["is_game_related"] = i.get("sentiment", "Neutral") != "Irrelevant"
             _search_cache = {}
             for i in items:
                 p = i.get("platform", "other")
@@ -217,7 +243,7 @@ def _load_today_search_to_cache() -> bool:
                     _search_cache[p] = []
                 _search_cache[p].append(i)
             _search_time = datetime.utcnow()
-            print(f"[Search] Loaded and re-analyzed {len(items)} items from {filepath}")
+            print(f"[Search] Loaded {len(items)} items from {filepath}")
             return True
     except Exception as e:
         print(f"[Search] Failed to load {filepath}: {e}")
@@ -395,6 +421,23 @@ async def get_dashboard():
         _load_today_search_to_cache()
     if not any(len(v) for v in _hot_cache.values()):
         _load_hot_crawl_from_file()
+
+    # Ensure daily stats exist in DB (for history page after restart)
+    try:
+        db = SessionLocal()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        existing = db.query(DailyStatsModel).filter(DailyStatsModel.date == today).first()
+        if not existing and (any(len(v) for v in _hot_cache.values()) or any(len(v) for v in _search_cache.values())):
+            all_items = []
+            for p in set(list(_hot_cache.keys()) + list(_search_cache.keys())):
+                for items in [_hot_cache.get(p, []), _search_cache.get(p, [])]:
+                    all_items.extend(items)
+            platforms = list(set(list(_hot_cache.keys()) + list(_search_cache.keys())))
+            _store_to_db(all_items, platforms)
+            print(f"[Dashboard] Synced {len(all_items)} items to daily stats")
+        db.close()
+    except:
+        pass
 
     all_platforms = set(list(_hot_cache.keys()) + list(_search_cache.keys()))
     for p in all_platforms:
@@ -588,11 +631,12 @@ def _deepseek_analyze(title: str) -> Optional[str]:
         return None
 
     prompt = f"""你是米哈游舆情分析专家。判断以下标题对米哈游的情感倾向。
-规则（严禁回复"中性"，除非完全无法判断）：
+规则：
 - 赞扬、推荐、好消息、正面数据 → 正面
-- 批评、抱怨、负面数据、节奏 → 负面  
+- 批评、抱怨、负面数据、节奏 → 负面
+- 客观陈述、中性数据、事实报道 → 中性
 - 与米哈游/二游完全无关 → 无关
-只回复两个字：正面、负面 或 无关
+只回复两个字：正面、负面、中性 或 无关
 
 标题：{title}"""
 
@@ -824,6 +868,39 @@ def _run_deepseek_batch_analyze(lock_file: Path):
         print(f"[DeepSeek-Batch] DB update error: {e}")
 
     print(f"[DeepSeek-Batch] Done: {analyzed}/{total} analyzed, {changed} sentiment changed")
+
+    # Re-persist all data files with updated DeepSeek sentiments (survive restart)
+    try:
+        data_dir = _get_search_data_dir()
+        today = datetime.utcnow().strftime("%Y%m%d")
+        # Update paid search JSON
+        paid_file = data_dir / f"{today}.json"
+        if paid_file.exists():
+            with open(paid_file, "r", encoding="utf-8") as f:
+                paid = json.load(f)
+            paid_items = paid.get("parsed_items", [])
+            for pi in paid_items:
+                for item in all_items:
+                    if pi.get("id") == item.get("id"):
+                        pi["sentiment"] = item.get("sentiment")
+            paid["parsed_items"] = paid_items
+            with open(paid_file, "w", encoding="utf-8") as f:
+                json.dump(paid, f, ensure_ascii=False, indent=2)
+            print(f"[DeepSeek-Batch] Updated {paid_file}")
+        # Update hot crawl JSON
+        hot_file = data_dir / "hot_crawl.json"
+        if hot_file.exists():
+            with open(hot_file, "r", encoding="utf-8") as f:
+                hot_list = json.load(f)
+            for hi in hot_list:
+                for item in all_items:
+                    if hi.get("id") == item.get("id"):
+                        hi["sentiment"] = item.get("sentiment")
+            with open(hot_file, "w", encoding="utf-8") as f:
+                json.dump(hot_list, f, ensure_ascii=False, indent=2)
+            print(f"[DeepSeek-Batch] Updated {hot_file}")
+    except Exception as e:
+        print(f"[DeepSeek-Batch] Persist error: {e}")
     # Lock file already exists, keeping it for the day
 
 
@@ -1042,7 +1119,9 @@ CATEGORIES_FILE: Optional[Path] = None
 def _get_categories_path() -> Path:
     global CATEGORIES_FILE
     if CATEGORIES_FILE is None:
-        CATEGORIES_FILE = Path(__file__).resolve().parent.parent / "data" / "categories.json"
+        d = _get_data_base()
+        d.mkdir(parents=True, exist_ok=True)
+        CATEGORIES_FILE = d / "categories.json"
     return CATEGORIES_FILE
 
 def _load_categories() -> dict:
