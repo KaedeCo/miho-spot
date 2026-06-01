@@ -5,6 +5,7 @@ import HotTopics from "./pages/HotTopics";
 import Keywords from "./pages/Keywords";
 import History from "./pages/History";
 import Accounts from "./pages/Accounts";
+import CheckIdentity from "./pages/CheckIdentity";
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
           <Route path="/topics" element={<HotTopics />} />
           <Route path="/keywords" element={<Keywords />} />
           <Route path="/history" element={<History />} />
+          <Route path="/identity" element={<CheckIdentity />} />
           <Route path="/accounts" element={<Accounts />} />
         </Route>
       </Routes>

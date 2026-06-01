@@ -1,14 +1,30 @@
-import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry } from "../types";
+import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult } from "../types";
 
 const BASE_URL = "/api";
 
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${url}`, {
+  const fullUrl = `${BASE_URL}${url}`;
+  console.log(`[API] ${options?.method || "GET"} ${fullUrl}`);
+  const res = await fetch(fullUrl, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  if (!res.ok) throw new Error(`API Error: ${res.status}`);
-  return res.json();
+  if (!res.ok) {
+    const text = await res.text().catch(() => "(empty)");
+    console.error(`[API] ${res.status} ${fullUrl}: ${text.slice(0, 300)}`);
+    throw new Error(`API ${res.status}: ${text.slice(0, 100)}`);
+  }
+  const text = await res.text();
+  if (!text || text.trim().length === 0) {
+    console.error(`[API] Empty response from ${fullUrl}`);
+    throw new Error(`Empty response from server (${fullUrl}) - check backend is running`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    console.error(`[API] Invalid JSON from ${fullUrl}:`, text.slice(0, 500));
+    throw new Error(`Invalid JSON response (${text.slice(0, 80)})`);
+  }
 }
 
 export async function getDashboardData(): Promise<DashboardData> {
@@ -146,4 +162,25 @@ export async function saveAccount(account: AccountCredential): Promise<AccountCr
 
 export async function verifyAccount(platform: Platform, cookie?: string): Promise<{ isValid: boolean; message?: string }> {
   return fetchJSON(`/accounts/${platform}/verify`, { method: "POST", body: JSON.stringify({ cookie: cookie || "" }) });
+}
+
+// ========== Bilibili "查成分" API ==========
+
+export async function getBiliUserInfo(uid: number): Promise<{ ok: boolean; data?: BiliUserInfo; error?: string }> {
+  return fetchJSON(`/bilibili/user/info?uid=${uid}`);
+}
+
+export async function getBiliAnalyzeStatus(uid: number): Promise<BiliAnalyzeStatus> {
+  return fetchJSON(`/bilibili/analyze/status?uid=${uid}`);
+}
+
+export async function getBiliAnalyzeResult(uid: number, page: number = 1, pageSize: number = 100): Promise<BiliAnalyzeResult> {
+  return fetchJSON(`/bilibili/analyze/result?uid=${uid}&page=${page}&page_size=${pageSize}`);
+}
+
+export async function triggerBiliAnalyze(uid: number, maxVideos: number = 50, maxComments: number = 500, monthsLimit: number = 6): Promise<{ ok: boolean; message?: string; uid?: number; error?: string }> {
+  return fetchJSON("/bilibili/analyze", {
+    method: "POST",
+    body: JSON.stringify({ uid, max_videos: maxVideos, max_comments_per_video: maxComments, months_limit: monthsLimit }),
+  });
 }

@@ -113,3 +113,65 @@ export interface AnalysisResult {
     neutral: number;
   };
 }
+
+// ========== Bilibili "查成分" Types ==========
+
+export interface BiliUserInfo {
+  uid: number;
+  name: string;
+  face: string;
+  sign: string;
+  level: number;
+  sex: string;
+  home_url: string;
+}
+
+export interface BiliComment {
+  rpid: number;
+  content: string;
+  ctime: number;
+  time_str: string;
+  video_title: string;
+  video_bvid: string;
+  video_aid: number;
+  video_url: string;
+  comment_url: string;
+  likes: number;
+  reply_count: number;
+  matched_keywords?: string[];
+  matched_categories?: string[];
+}
+
+export interface BiliSpectrum {
+  score: number;
+  mihoyo_attitude: string;
+  active_areas: string;
+  personality: string;
+  summary: string;
+}
+
+export interface BiliAnalyzeStatus {
+  exists: boolean;
+  status?: string;
+  uid: number;
+  total_comments?: number;
+  matched_count?: number;
+  score?: number;
+  analyzed_at?: string;
+}
+
+export interface BiliAnalyzeResult {
+  ok: boolean;
+  error?: string;
+  status?: string;
+  uid?: number;
+  user_info?: BiliUserInfo;
+  total_comments?: number;
+  matched_count?: number;
+  comments?: BiliComment[];
+  page?: number;
+  page_size?: number;
+  total_pages?: number;
+  spectrum?: BiliSpectrum;
+  analyzed_at?: string;
+}

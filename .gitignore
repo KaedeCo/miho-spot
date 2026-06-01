@@ -1,49 +1,45 @@
+# OS files
+Thumbs.db
+.DS_Store
+
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
+.pytest_cache/
 *.spec
-*.exe
+backend/.deps_ok
+backend/app/data/miho_spot.db
 
 # Node
 node_modules/
-.vite/
+frontend/dist/
 
 # IDE
-.idea/
 .vscode/
-*.swp
-*.swo
+.idea/
 
-# Environment
-.env
-.env.local
-
-# Database & Data (contains user API keys)
-*.db
-*.sqlite3
-**/data/
-miho-spot-desktop/app_gui/
-
-# Junk
-$null
-*.dsstored
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Debug
+# Research / temp files
+research_report_*.md
+research_plan_*.md
+nul*
 debug*.png
 sidebar_*.png
 
-# PyInstaller
-*.manifest
-warn-*.txt
-
-# Archives
+# Unrelated directories
 Archived/
 Novel_Archieved/
 novel_blog/
+
+# Desktop builds (separate release)
+miho-spot-desktop/dist/
+miho-spot-desktop/build/
+miho-spot-desktop/*.spec
+miho-spot-with-modules/
+
+# Data files with potential secrets
+*.dsstored
+backend/app/data/tophub_search/*.json
+

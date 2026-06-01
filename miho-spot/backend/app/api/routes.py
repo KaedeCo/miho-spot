@@ -1308,6 +1308,196 @@ def _verify_tophub(api_key=""):
         return {"isValid": False, "message": f"网络错误: {str(e)[:60]}"}
 
 
+# ==================== Bilibili User Comment Analysis ("查成分") ====================
+
+import asyncio as _asyncio_mod
+
+# In-memory cache for analysis results (uid → result dict)
+_bili_analysis_cache: dict = {}
+_bili_analysis_lock = threading.Lock()
+
+
+def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_limit: int):
+    """Background task: fetch comments, filter, and analyze with DeepSeek."""
+    global _bili_analysis_cache
+    import traceback as _tb
+    try:
+        print(f"[BiliAnalyze] Starting analysis for uid={uid}")
+        loop = _asyncio_mod.new_event_loop()
+        _asyncio_mod.set_event_loop(loop)
+        from app.bilibili import fetch_user_video_comments, filter_comments_by_keywords, analyze_user_personality, get_user_info
+        print(f"[BiliAnalyze] Fetching user info...")
+        user_info = loop.run_until_complete(get_user_info(uid))
+        print(f"[BiliAnalyze] User: {user_info.get('name')}")
+        print(f"[BiliAnalyze] Fetching comments...")
+        all_comments = loop.run_until_complete(
+            fetch_user_video_comments(uid, max_videos=max_videos,
+                                       max_comments_per_video=max_comments,
+                                       months_limit=months_limit)
+        )
+        loop.close()
+        print(f"[BiliAnalyze] Got {len(all_comments)} comments total")
+
+        # Filter by keywords (for marking, not for exclusion)
+        print(f"[BiliAnalyze] Filtering by keywords...")
+        matched_comments = filter_comments_by_keywords(all_comments)
+        print(f"[BiliAnalyze] {len(matched_comments)} comments matched keywords")
+
+        # DeepSeek personality analysis (always run if API key set, even 0 matched)
+        ds_key = _get_deepseek_key()
+        print(f"[BiliAnalyze] DeepSeek configured: {bool(ds_key)}, matched={len(matched_comments)}, total={len(all_comments)}")
+        spectrum = None
+        if ds_key and all_comments:
+            print(f"[BiliAnalyze] Calling DeepSeek for personality analysis...")
+            loop2 = _asyncio_mod.new_event_loop()
+            _asyncio_mod.set_event_loop(loop2)
+            spectrum = loop2.run_until_complete(analyze_user_personality(all_comments, matched_comments, ds_key))
+            loop2.close()
+            print(f"[BiliAnalyze] DeepSeek result: score={spectrum.get('score')}, summary={spectrum.get('summary')}")
+        elif ds_key and not all_comments:
+            spectrum = {
+                "score": 50, "mihoyo_attitude": "该用户无历史评论记录", "active_areas": "未知",
+                "personality": "无法分析", "summary": "无评论数据"
+            }
+        else:
+            spectrum = {
+                "score": 50, "mihoyo_attitude": "未配置DeepSeek API Key", "active_areas": "未知",
+                "personality": "无法分析", "summary": "请先配置API Key"
+            }
+
+        result = {
+            "status": "done",
+            "uid": uid,
+            "user_info": user_info,
+            "total_comments": len(all_comments),
+            "matched_count": len(matched_comments),
+            "all_comments": all_comments,           # ALL comments for display
+            "comments": matched_comments,            # keyword-matched subset
+            "spectrum": spectrum,
+            "analyzed_at": datetime.utcnow().isoformat(),
+        }
+        with _bili_analysis_lock:
+            _bili_analysis_cache[str(uid)] = result
+        print(f"[BiliAnalyze] Done: uid={uid}, {len(all_comments)} comments, {len(matched_comments)} matched, score={spectrum.get('score')}")
+    except Exception as e:
+        print(f"[BiliAnalyze] FATAL ERROR for uid={uid}: {e}")
+        _tb.print_exc()
+        error_result = {
+            "status": "error",
+            "uid": uid,
+            "error": str(e),
+            "total_comments": 0,
+            "matched_count": 0,
+            "comments": [],
+            "spectrum": {"score": 50, "analysis": f"分析出错: {str(e)[:100]}", "summary": "出错"},
+        }
+        with _bili_analysis_lock:
+            _bili_analysis_cache[str(uid)] = error_result
+
+
+@router.get("/bilibili/user/info")
+async def get_bili_user_info(uid: int):
+    """Get Bilibili user basic info by UID."""
+    import traceback as _tb
+    try:
+        from app.bilibili import get_user_info as _bili_get_user
+        print(f"[API] /bilibili/user/info uid={uid}")
+        info = await _bili_get_user(uid)
+        print(f"[API] /bilibili/user/info OK: {info.get('name', '?')}")
+        return {"ok": True, "data": info}
+    except Exception as e:
+        print(f"[API] /bilibili/user/info ERROR: {e}")
+        _tb.print_exc()
+        return {"ok": False, "error": str(e)}
+
+
+@router.get("/bilibili/analyze/status")
+async def get_bili_analyze_status(uid: int):
+    """Check if analysis for a UID exists in cache."""
+    with _bili_analysis_lock:
+        result = _bili_analysis_cache.get(str(uid))
+    if result:
+        return {
+            "exists": True,
+            "status": result.get("status"),
+            "uid": uid,
+            "total_comments": result.get("total_comments", 0),
+            "matched_count": result.get("matched_count", 0),
+            "score": result.get("spectrum", {}).get("score"),
+            "analyzed_at": result.get("analyzed_at", ""),
+        }
+    return {"exists": False, "uid": uid}
+
+
+@router.get("/bilibili/analyze/result")
+async def get_bili_analyze_result(uid: int, page: int = 1, page_size: int = 100):
+    """Get cached analysis result with paginated ALL comments."""
+    with _bili_analysis_lock:
+        result = _bili_analysis_cache.get(str(uid))
+    if not result:
+        return {"ok": False, "error": "该UID尚未分析，请先执行分析"}
+
+    # Return ALL comments (paginated). For old cache without all_comments, fall back to comments
+    all_comments = result.get("all_comments") or result.get("comments") or []
+    total = len(all_comments)
+    start = (page - 1) * page_size
+    end = start + page_size
+    paged_comments = all_comments[start:end]
+
+    return {
+        "ok": True,
+        "status": result.get("status"),
+        "uid": result.get("uid"),
+        "user_info": result.get("user_info"),
+        "total_comments": result.get("total_comments", 0),
+        "matched_count": result.get("matched_count", 0),
+        "comments": paged_comments,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+        "spectrum": result.get("spectrum"),
+        "analyzed_at": result.get("analyzed_at"),
+    }
+
+
+@router.post("/bilibili/analyze")
+async def trigger_bili_analyze(body: dict):
+    """Trigger Bilibili user comment analysis.
+    Body: {"uid": int, "max_videos": int (opt), "max_comments_per_video": int (opt), "months_limit": int (opt)}
+    """
+    uid = body.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="请提供用户UID")
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="UID必须是数字")
+
+    max_videos = int(body.get("max_videos", 50))
+    max_comments = int(body.get("max_comments_per_video", 500))
+    months_limit = int(body.get("months_limit", 6))
+
+    # Check if already analyzing
+    with _bili_analysis_lock:
+        existing = _bili_analysis_cache.get(str(uid))
+        if existing and existing.get("status") == "processing":
+            return {"ok": False, "error": "该UID正在分析中，请稍后查看结果"}
+
+        _bili_analysis_cache[str(uid)] = {"status": "processing", "uid": uid}
+
+    threading.Thread(
+        target=_run_bili_analyze_sync,
+        args=(uid, max_videos, max_comments, months_limit),
+        daemon=True,
+    ).start()
+
+    return {
+        "ok": True,
+        "message": f"正在分析UID {uid} 的历史评论（近{months_limit}个月，最多扫描{max_videos}个视频）...",
+        "uid": uid,
+    }
+
+
 # Helpers
 def _t(t): return {"id":t.id,"platform":t.platform,"title":t.title,"rank":t.rank,"heat":t.heat,"url":t.url or "","fetchedAt":t.fetched_at.isoformat() if t.fetched_at else "","sentiment":t.sentiment,"relatedGame":t.related_game,"isGameRelated":t.is_game_related}
 def _p(p): return {"id":p.id,"topicId":p.topic_id,"platform":p.platform,"content":p.content,"author":p.author or "","likes":p.likes or 0,"comments":p.comments or 0,"timestamp":p.timestamp.isoformat() if p.timestamp else "","sentiment":p.sentiment,"url":p.url or ""}

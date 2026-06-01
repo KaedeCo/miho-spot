@@ -60,10 +60,14 @@ pyinstaller --onefile --windowed ^
     --hidden-import=PyQt6.QtWidgets ^
     --hidden-import=PyQt6.QtCore ^
     --hidden-import=PyQt6.QtGui ^
+    --hidden-import=jieba ^
+    --hidden-import=curl_cffi ^
     --collect-submodules app ^
     --collect-all starlette ^
     --collect-all PyQt6 ^
+    --collect-all curl_cffi ^
     --collect-data snownlp ^
+    --collect-data jieba ^
     --noconfirm ^
     main.py
 
