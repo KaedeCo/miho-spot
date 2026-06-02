@@ -23,29 +23,51 @@ AICU_HEADERS = {
 
 
 def _aicu_get(url: str, params: dict = None) -> dict:
-    """Call AICU API with curl_cffi (bypasses Cloudflare)."""
+    """Call AICU API with curl_cffi (retries with different browser fingerprints)."""
     if params is None:
         params = {}
-    try:
-        resp = cffi_requests.get(
-            url, params=params, headers=AICU_HEADERS,
-            impersonate="chrome131", timeout=30
-        )
-        if resp.status_code != 200:
-            hint = ""
-            if resp.status_code == 403:
-                hint = " (可能被Cloudflare拦截，建议切换IP或稍后重试)"
-            raise RuntimeError(f"AICU API HTTP {resp.status_code}{hint}: {resp.text[:200]}")
-        data = resp.json()
-    except Exception as e:
-        if "403" in str(e) or "Cloudflare" in str(e):
-            raise RuntimeError(f"AICU API 被风控拦截，请切换网络/IP后重试。详情: {str(e)[:200]}")
-        raise
-    # Validate response
-    if data.get("code") != 0:
-        msg = data.get("message", "unknown error")
-        raise RuntimeError(f"AICU API error: {msg}")
-    return data.get("data", {})
+    impersonations = [
+        "chrome146", "chrome145", "chrome142", "chrome136", "chrome133a",
+        "chrome131", "chrome124", "chrome123", "chrome120", "chrome119",
+        "chrome116", "chrome110", "chrome107", "chrome104", "chrome101", "chrome100", "chrome99",
+        "chrome131_android", "chrome99_android",
+        "edge101", "edge99",
+        "firefox147", "firefox144", "firefox135", "firefox133",
+        "safari2601", "safari260", "safari184", "safari180", "safari170", "safari155", "safari153",
+        "safari18_4", "safari18_0", "safari17_0",
+        "safari260_ios", "safari184_ios", "safari180_ios", "safari172_ios",
+        "safari18_4_ios", "safari18_0_ios", "safari17_2_ios",
+    ]
+    last_error = None
+    for imp in impersonations:
+        try:
+            resp = cffi_requests.get(
+                url, params=params, headers=AICU_HEADERS,
+                impersonate=imp, timeout=30
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") != 0:
+                    raise RuntimeError(f"AICU API error: {data.get('message', 'unknown')}")
+                return data.get("data", {})
+
+            # WAF block: try next fingerprint
+            if resp.status_code in (403, 468) or "safeline" in resp.text.lower():
+                print(f"[Bilibili] AICU {imp} blocked (HTTP {resp.status_code}), trying next...")
+                time.sleep(1)
+                continue
+
+            raise RuntimeError(f"AICU API HTTP {resp.status_code}: {resp.text[:200]}")
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_error = e
+            print(f"[Bilibili] AICU {imp} error: {e}")
+            time.sleep(1)
+            continue
+
+    raise RuntimeError(f"AICU 所有浏览器指纹均被拦截，请切换网络/IP。最后错误: {str(last_error)[:200]}")
 
 
 # ---- Public API Functions ----
@@ -207,9 +229,16 @@ async def fetch_user_video_comments(
             if is_end or page >= (all_count + 99) // 100:
                 break
             page += 1
-            time.sleep(0.5)
+            time.sleep(6)  # Safeline WAF: strict IP rate limit, need 6s between pages
         except Exception as e:
+            err_str = str(e)
+            if "safeline" in err_str.lower() or "468" in err_str or "403" in err_str or "503" in err_str:
+                print(f"[Bilibili] AICU page {page} IP blocked (HTTP 468/503), cooling 60s...")
+                time.sleep(60)
+                continue
             print(f"[Bilibili] AICU page {page} error: {e}")
+            if raw_comments:
+                page += 1; time.sleep(5); continue
             break
 
     print(f"[Bilibili] AICU fetched {len(raw_comments)} raw comments")
@@ -335,9 +364,13 @@ async def analyze_user_personality(all_comments: List[dict], matched_comments: L
     prompt = f"""你是一个专业的用户画像分析师。请根据以下B站用户的创作内容和评论记录，分析该用户的人格特征。
 
 分析维度：
-1. 对米哈游游戏的态度：请分析该用户对米哈游（原神、星穹铁道、绝区零、崩坏等）的总体态度。描述其是支持还是反对，情绪倾向如何，并给出0-100的分数（0=极度反对，50=中立，100=极度支持）。
-2. 主要活跃领域：根据视频/专栏标题和评论内容，推断该用户活跃的游戏圈子、创作方向和关注点。
-3. 性格推测：根据语言风格、互动方式、创作倾向推断该用户可能的人格类型和特点。
+1. 对米哈游游戏的态度：请分析该用户对米哈游（原神、星穹铁道、绝区零、崩坏等）的总体态度。描述其是支持还是反对，情绪倾向如何，并给出score_x（0-100的整数，0=极度反对，50=中立，100=极度支持）。
+2. 社区言论理性程度：分析该用户的言论风格偏理性还是感性。给出score_y（0-100的整数，0=极度理性/数据驱动/逻辑严密，50=均衡，100=极度感性/情绪化/主观表达）。
+3. 主要活跃领域：根据视频/专栏标题和评论内容，推断该用户活跃的游戏圈子、创作方向和关注点。
+4. 性格推测：根据语言风格、互动方式、创作倾向推断该用户可能的人格类型和特点。
+
+评分建议：
+- 避免给出过于规整的分数（如30、40、50、55、60等整十整五）。请使用更自然的分数如37、52、68、73、81等，以体现评分差异化和分析深度。
 
 请注意：
 - 视频和专栏标题反映用户的创作方向（UP主身份）
@@ -350,7 +383,7 @@ async def analyze_user_personality(all_comments: List[dict], matched_comments: L
 ---
 
 请严格按照以下JSON格式回复（不要添加任何其他文字）：
-{{"score": 0到100的整数, "mihoyo_attitude": "对米哈游态度的详细分析（100字以内）", "active_areas": "主要活跃领域推断（100字以内）", "personality": "性格推测（100字以内）", "summary": "一句话总结（20字以内）"}}"""
+{{"score_x": 0到100的整数, "score_y": 0到100的整数, "mihoyo_attitude": "对米哈游态度的详细分析（100字以内）", "active_areas": "主要活跃领域推断（100字以内）", "personality": "性格推测（100字以内）", "summary": "一句话总结（20字以内）"}}"""
 
     try:
         async with httpx.AsyncClient() as client:
@@ -358,7 +391,7 @@ async def analyze_user_personality(all_comments: List[dict], matched_comments: L
                 "https://api.deepseek.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
-                      "temperature": 0.5, "max_tokens": 500},
+                      "temperature": 0.7, "max_tokens": 500},
                 timeout=60,
             )
             data = resp.json()
@@ -366,9 +399,12 @@ async def analyze_user_personality(all_comments: List[dict], matched_comments: L
             answer = re.sub(r'^```(?:json)?\s*', '', answer)
             answer = re.sub(r'\s*```$', '', answer)
             result = json.loads(answer)
-            score = max(0, min(100, int(result.get("score", 50))))
+            score_x = max(0, min(100, int(result.get("score_x", result.get("score", 50)))))
+            score_y = max(0, min(100, int(result.get("score_y", 50))))
             return {
-                "score": score,
+                "score": score_x,
+                "score_x": score_x,
+                "score_y": score_y,
                 "mihoyo_attitude": result.get("mihoyo_attitude", "分析完成"),
                 "active_areas": result.get("active_areas", "分析完成"),
                 "personality": result.get("personality", "分析完成"),
@@ -376,7 +412,7 @@ async def analyze_user_personality(all_comments: List[dict], matched_comments: L
             }
     except json.JSONDecodeError as e:
         print(f"[DeepSeek] JSON parse error: {e}")
-        return {"score": 50, "mihoyo_attitude": "AI分析结果解析失败", "active_areas": "未知", "personality": "分析异常", "summary": "分析异常"}
+        return {"score": 50, "score_x": 50, "score_y": 50, "mihoyo_attitude": "AI分析结果解析失败", "active_areas": "未知", "personality": "分析异常", "summary": "分析异常"}
     except Exception as e:
         print(f"[DeepSeek] Error: {e}")
-        return {"score": 50, "mihoyo_attitude": f"AI分析失败: {str(e)[:100]}", "active_areas": "未知", "personality": "分析失败", "summary": "分析失败"}
+        return {"score": 50, "score_x": 50, "score_y": 50, "mihoyo_attitude": f"AI分析失败: {str(e)[:100]}", "active_areas": "未知", "personality": "分析失败", "summary": "分析失败"}

@@ -8,6 +8,7 @@ import {
   HistoryIcon,
   SettingIcon,
   SearchIcon,
+  LocationIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
 } from "tdesign-icons-react";
@@ -18,6 +19,7 @@ const menuItems = [
   { path: "/keywords", label: "关键词词典", icon: <BookIcon /> },
   { path: "/history", label: "历史统计", icon: <HistoryIcon /> },
   { path: "/identity", label: "查成分", icon: <SearchIcon /> },
+  { path: "/spectrum", label: "二维光谱图", icon: <LocationIcon /> },
   { path: "/accounts", label: "账号管理", icon: <SettingIcon /> },
 ];
 

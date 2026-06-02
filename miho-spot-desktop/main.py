@@ -134,7 +134,7 @@ class BackendGUI(QMainWindow):
         tc = Card(); tl = QHBoxLayout(tc); tl.setContentsMargins(16, 10, 16, 8)
         t = QLabel("⚡ Miho-spot Backend · 米哈游舆情监测系统")
         t.setStyleSheet(f"font-size:18px;font-weight:800;color:{CT};"); tl.addWidget(t)
-        tl.addStretch(); sub = QLabel("v1.0"); sub.setStyleSheet(f"color:{CD};font-size:11px;"); tl.addWidget(sub)
+        tl.addStretch(); sub = QLabel("v1.2"); sub.setStyleSheet(f"color:{CD};font-size:11px;"); tl.addWidget(sub)
         root.addWidget(tc)
 
         # Status

@@ -12,7 +12,7 @@ import hashlib
 import json
 
 from app.models import get_db, SessionLocal, init_db
-from app.models import HotTopicModel, PostItemModel, DailyStatsModel, KeywordModel, AccountModel
+from app.models import HotTopicModel, PostItemModel, DailyStatsModel, KeywordModel, AccountModel, BiliUserProfile
 from app.crawlers import get_crawler
 
 router = APIRouter(prefix="/api")
@@ -39,6 +39,10 @@ _hot_cache: dict = {"zhihu": [], "douyin": [], "tieba": []}
 _search_cache: dict = {"zhihu": [], "douyin": [], "tieba": []}
 _hot_time: Optional[datetime] = None
 _search_time: Optional[datetime] = None
+
+# Search error state (separate from AICU/Bilibili)
+_search_error: Optional[str] = None
+_search_error_code: Optional[str] = None
 
 # User-configurable search keywords - persist in module-level
 _search_keywords: Optional[List[str]] = None  # Lazy init from DB or default
@@ -252,7 +256,11 @@ def _load_today_search_to_cache() -> bool:
 
 def _run_keyword_search(keywords: List[str] = None):
     """Call Tophub /search API (paid endpoint) and persist results to local file immediately."""
-    global _search_cache, _search_time
+    global _search_cache, _search_time, _search_error, _search_error_code
+
+    # Reset error state at start
+    _search_error = None
+    _search_error_code = None
 
     # Foolproof: check if today's data already exists
     if _check_today_search_exists():
@@ -275,7 +283,11 @@ def _run_keyword_search(keywords: List[str] = None):
         result = fetch_tophub_search(keyword, 1)
         raw_data = result
         if result.get("error"):
-            print(f"[Search] API returned error: {result.get('msg', 'unknown')}")
+            msg = result.get("msg", "unknown Tophub API error")
+            code = str(result.get("code", result.get("status", "TOPHUB_ERR")))
+            print(f"[Search] API returned error: code={code}, msg={msg}")
+            _search_error = msg
+            _search_error_code = f"TOPHUB_{code}"
             return
 
         data = result.get("data", {})
@@ -304,6 +316,8 @@ def _run_keyword_search(keywords: List[str] = None):
         for p in range(2, min(total_pages + 1, 4)):
             r = fetch_tophub_search(keyword, p)
             if r.get("error"):
+                _search_error = r.get("msg", f"Tophub API error on page {p}")
+                _search_error_code = f"TOPHUB_PAGE_{p}_ERR"
                 break
             page_data = r.get("data", {})
             page_items = page_data.get("items", [])
@@ -325,7 +339,10 @@ def _run_keyword_search(keywords: List[str] = None):
             print(f"[Search] Page {p}: {len(page_items)} items (cumulative: {len(all_items)})")
 
     except Exception as e:
-        print(f"[Search] Error: {e}")
+        err_str = str(e)
+        print(f"[Search] Error: {err_str}")
+        _search_error = err_str[:200]
+        _search_error_code = "SEARCH_EXCEPTION"
         return
 
     # Analyze sentiment BEFORE persisting (so saved file has analyzed data)
@@ -519,6 +536,9 @@ async def crawl_status():
         },
         "lastHotCrawl": _hot_time.isoformat() if _hot_time else None,
         "lastSearch": _search_time.isoformat() if _search_time else None,
+        # Tophub-specific error state (separate from AICU)
+        "searchError": _search_error,
+        "searchErrorCode": _search_error_code,
     }
 
 
@@ -1358,12 +1378,14 @@ def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_
             print(f"[BiliAnalyze] DeepSeek result: score={spectrum.get('score')}, summary={spectrum.get('summary')}")
         elif ds_key and not all_comments:
             spectrum = {
-                "score": 50, "mihoyo_attitude": "该用户无历史评论记录", "active_areas": "未知",
+                "score": 50, "score_x": 50, "score_y": 50,
+                "mihoyo_attitude": "该用户无历史评论记录", "active_areas": "未知",
                 "personality": "无法分析", "summary": "无评论数据"
             }
         else:
             spectrum = {
-                "score": 50, "mihoyo_attitude": "未配置DeepSeek API Key", "active_areas": "未知",
+                "score": 50, "score_x": 50, "score_y": 50,
+                "mihoyo_attitude": "未配置DeepSeek API Key", "active_areas": "未知",
                 "personality": "无法分析", "summary": "请先配置API Key"
             }
 
@@ -1468,9 +1490,10 @@ async def get_bili_analyze_result(uid: int, page: int = 1, page_size: int = 100)
 
 @router.post("/bilibili/analyze")
 async def trigger_bili_analyze(body: dict):
-    """Trigger Bilibili user comment analysis.
-    Body: {"uid": int, "max_videos": int (opt), "max_comments_per_video": int (opt), "months_limit": int (opt)}
-    """
+    """Trigger Bilibili user comment analysis."""
+    import sys
+    print(f"[API] /bilibili/analyze POST received: {body}", flush=True)
+    sys.stdout.flush()
     uid = body.get("uid")
     if not uid:
         raise HTTPException(status_code=400, detail="请提供用户UID")
@@ -1502,6 +1525,266 @@ async def trigger_bili_analyze(body: dict):
         "message": f"正在分析UID {uid} 的历史评论（近{months_limit}个月，最多扫描{max_videos}个视频）...",
         "uid": uid,
     }
+
+
+# ==================== Bilibili Profile Persistence ====================
+
+@router.post("/bilibili/save")
+async def save_bili_profile(body: dict):
+    """Save a B站 user's analysis result to SQLite for 2D spectrum display."""
+    uid = body.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="请提供UID")
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="UID必须是数字")
+
+    with _bili_analysis_lock:
+        cached = _bili_analysis_cache.get(str(uid))
+    if not cached or cached.get("status") != "done":
+        raise HTTPException(status_code=400, detail="该用户尚未完成分析，请先执行查成分")
+
+    spectrum = cached.get("spectrum", {})
+    user_info = cached.get("user_info", {})
+    all_comments = cached.get("all_comments", [])
+    user_content = cached.get("user_content", [])
+
+    # Build lightweight comment storage (strip heavy fields)
+    comments_save = []
+    for c in all_comments[:2000]:  # max 2000 comments
+        comments_save.append({
+            "rpid": c.get("rpid", ""),
+            "content": c.get("content", ""),
+            "ctime": c.get("ctime", 0),
+            "time_str": c.get("time_str", ""),
+            "matched_keywords": c.get("matched_keywords", []),
+            "matched_categories": c.get("matched_categories", []),
+        })
+
+    # Build lightweight content storage
+    content_save = []
+    for c in user_content:
+        content_save.append({
+            "type": c.get("type", ""),
+            "id": c.get("id", ""),
+            "title": c.get("title", ""),
+            "bvid": c.get("bvid", ""),
+            "url": c.get("url", ""),
+            "time_str": c.get("time_str", ""),
+            "play": c.get("play", 0),
+            "duration": c.get("duration", 0),
+            "cover": c.get("cover", ""),
+        })
+
+    db = SessionLocal()
+    try:
+        existing = db.query(BiliUserProfile).filter(BiliUserProfile.uid == uid).first()
+        if existing:
+            existing.name = user_info.get("name", "")
+            existing.face = user_info.get("face", "")
+            existing.score_x = spectrum.get("score_x", 50)
+            existing.score_y = spectrum.get("score_y", 50)
+            existing.mihoyo_attitude = spectrum.get("mihoyo_attitude", "")
+            existing.active_areas = spectrum.get("active_areas", "")
+            existing.personality = spectrum.get("personality", "")
+            existing.summary = spectrum.get("summary", "")
+            existing.comments_json = comments_save
+            existing.content_json = content_save
+            existing.saved_at = datetime.utcnow()
+        else:
+            db.add(BiliUserProfile(
+                uid=uid,
+                name=user_info.get("name", ""),
+                face=user_info.get("face", ""),
+                score_x=spectrum.get("score_x", 50),
+                score_y=spectrum.get("score_y", 50),
+                mihoyo_attitude=spectrum.get("mihoyo_attitude", ""),
+                active_areas=spectrum.get("active_areas", ""),
+                personality=spectrum.get("personality", ""),
+                summary=spectrum.get("summary", ""),
+                comments_json=comments_save,
+                content_json=content_save,
+            ))
+        db.commit()
+        print(f"[Save] Profile saved: uid={uid}, name={user_info.get('name')}, X={spectrum.get('score_x')}, Y={spectrum.get('score_y')}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+    return {"ok": True, "message": f"用户 {user_info.get('name', uid)} 的数据已存储", "uid": uid}
+
+
+@router.get("/bilibili/profiles")
+async def get_bili_profiles():
+    """Get all saved B站 user profiles for 2D spectrum display."""
+    db = SessionLocal()
+    try:
+        profiles = db.query(BiliUserProfile).order_by(BiliUserProfile.saved_at.desc()).all()
+        return {
+            "ok": True,
+            "profiles": [{
+                "uid": p.uid,
+                "name": p.name,
+                "face": p.face,
+                "score_x": p.score_x,
+                "score_y": p.score_y,
+                "summary": p.summary or "",
+                "saved_at": p.saved_at.isoformat() if p.saved_at else "",
+            } for p in profiles],
+        }
+    finally:
+        db.close()
+
+
+@router.get("/bilibili/profile/{uid}")
+async def get_bili_profile(uid: int, tab: str = "comments", page: int = 1):
+    """Get a saved profile with paginated comments or content."""
+    db = SessionLocal()
+    try:
+        p = db.query(BiliUserProfile).filter(BiliUserProfile.uid == uid).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="该用户未存储")
+        result = {
+            "ok": True,
+            "uid": p.uid,
+            "name": p.name,
+            "face": p.face,
+            "score_x": p.score_x,
+            "score_y": p.score_y,
+            "mihoyo_attitude": p.mihoyo_attitude or "",
+            "active_areas": p.active_areas or "",
+            "personality": p.personality or "",
+            "summary": p.summary or "",
+        }
+        if tab == "content":
+            items = (p.content_json or [])
+            page_size = 30
+            total = len(items)
+            start = (page - 1) * page_size
+            result["items"] = items[start:start + page_size]
+            result["total"] = total
+            result["page"] = page
+            result["page_size"] = page_size
+            result["total_pages"] = max(1, (total + page_size - 1) // page_size)
+        else:
+            items = (p.comments_json or [])
+            page_size = 100
+            total = len(items)
+            start = (page - 1) * page_size
+            result["items"] = items[start:start + page_size]
+            result["total"] = total
+            result["page"] = page
+            result["page_size"] = page_size
+            result["total_pages"] = max(1, (total + page_size - 1) // page_size)
+        return result
+    finally:
+        db.close()
+
+
+@router.delete("/bilibili/profile/{uid}")
+async def delete_bili_profile(uid: int):
+    """Delete a saved profile."""
+    db = SessionLocal()
+    try:
+        p = db.query(BiliUserProfile).filter(BiliUserProfile.uid == uid).first()
+        if p:
+            db.delete(p)
+            db.commit()
+            return {"ok": True, "message": "已删除"}
+        return {"ok": False, "message": "未找到该用户"}
+    finally:
+        db.close()
+
+
+# ==================== Bilibili Profile Export/Import ====================
+
+@router.get("/bilibili/export")
+async def export_bili_profiles():
+    """Export all saved B站 profiles as downloadable JSON."""
+    db = SessionLocal()
+    try:
+        profiles = db.query(BiliUserProfile).all()
+        data = {
+            "version": "1.1",
+            "exported_at": datetime.utcnow().isoformat(),
+            "profiles": []
+        }
+        for p in profiles:
+            data["profiles"].append({
+                "uid": p.uid, "name": p.name, "face": p.face,
+                "score_x": p.score_x, "score_y": p.score_y,
+                "mihoyo_attitude": p.mihoyo_attitude or "",
+                "active_areas": p.active_areas or "",
+                "personality": p.personality or "",
+                "summary": p.summary or "",
+                "comments_json": p.comments_json or [],
+                "content_json": p.content_json or [],
+                "saved_at": p.saved_at.isoformat() if p.saved_at else "",
+            })
+        json_str = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        return Response(content=json_str, media_type="application/json",
+                       headers={"Content-Disposition": "attachment; filename=miho_profiles.json"})
+    finally:
+        db.close()
+
+
+@router.post("/bilibili/import")
+async def import_bili_profiles(body: dict):
+    """Import B站 profiles from JSON. Modes: 'merge' (add new) or 'replace' (clear first)."""
+    mode = body.get("mode", "merge")
+    profiles = body.get("profiles", [])
+    if not profiles:
+        raise HTTPException(status_code=400, detail="profiles array is required")
+
+    db = SessionLocal()
+    imported = 0
+    updated = 0
+    try:
+        if mode == "replace":
+            db.query(BiliUserProfile).delete()
+        for p in profiles:
+            uid = p.get("uid")
+            if not uid:
+                continue
+            existing = db.query(BiliUserProfile).filter(BiliUserProfile.uid == uid).first()
+            if existing:
+                existing.name = p.get("name", existing.name)
+                existing.face = p.get("face", existing.face)
+                existing.score_x = p.get("score_x", existing.score_x)
+                existing.score_y = p.get("score_y", existing.score_y)
+                existing.mihoyo_attitude = p.get("mihoyo_attitude", existing.mihoyo_attitude)
+                existing.active_areas = p.get("active_areas", existing.active_areas)
+                existing.personality = p.get("personality", existing.personality)
+                existing.summary = p.get("summary", existing.summary)
+                existing.comments_json = p.get("comments_json", existing.comments_json)
+                existing.content_json = p.get("content_json", existing.content_json)
+                existing.saved_at = datetime.utcnow()
+                updated += 1
+            else:
+                db.add(BiliUserProfile(
+                    uid=uid, name=p.get("name", ""), face=p.get("face", ""),
+                    score_x=p.get("score_x", 50), score_y=p.get("score_y", 50),
+                    mihoyo_attitude=p.get("mihoyo_attitude", ""),
+                    active_areas=p.get("active_areas", ""),
+                    personality=p.get("personality", ""),
+                    summary=p.get("summary", ""),
+                    comments_json=p.get("comments_json", []),
+                    content_json=p.get("content_json", []),
+                ))
+                imported += 1
+        db.commit()
+        total = db.query(BiliUserProfile).count()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+    return {"ok": True, "imported": imported, "updated": updated, "total": total,
+            "message": f"导入完成：新增 {imported}，更新 {updated}，共 {total} 个用户"}
 
 
 # Helpers

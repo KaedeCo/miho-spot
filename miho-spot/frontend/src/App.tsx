@@ -6,6 +6,7 @@ import Keywords from "./pages/Keywords";
 import History from "./pages/History";
 import Accounts from "./pages/Accounts";
 import CheckIdentity from "./pages/CheckIdentity";
+import Spectrum2D from "./pages/Spectrum2D";
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
           <Route path="/keywords" element={<Keywords />} />
           <Route path="/history" element={<History />} />
           <Route path="/identity" element={<CheckIdentity />} />
+          <Route path="/spectrum" element={<Spectrum2D />} />
           <Route path="/accounts" element={<Accounts />} />
         </Route>
       </Routes>

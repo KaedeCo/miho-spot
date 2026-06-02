@@ -85,6 +85,24 @@ class AccountModel(Base):
     last_verified = Column(DateTime, nullable=True)
 
 
+class BiliUserProfile(Base):
+    """Persistent B站 user profile with analysis results."""
+    __tablename__ = "bili_user_profiles"
+
+    uid = Column(Integer, primary_key=True)
+    name = Column(String)
+    face = Column(String, default="")
+    score_x = Column(Integer, default=50)   # 米哈游态度 0-100
+    score_y = Column(Integer, default=50)   # 理性程度 0-100
+    mihoyo_attitude = Column(Text)
+    active_areas = Column(Text)
+    personality = Column(Text)
+    summary = Column(Text)
+    comments_json = Column(JSON, default=list)  # [{rpid, content, time_str, matched_keywords, ...}, ...]
+    content_json = Column(JSON, default=list)   # [{type, id, title, url, time_str, play, ...}, ...]
+    saved_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

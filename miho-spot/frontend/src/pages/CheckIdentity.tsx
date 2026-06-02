@@ -7,7 +7,7 @@ import {
   PlayCircleIcon, FileIcon,
 } from "tdesign-icons-react";
 import {
-  getBiliUserInfo, getBiliAnalyzeStatus, getBiliAnalyzeResult, triggerBiliAnalyze,
+  getBiliUserInfo, getBiliAnalyzeStatus, getBiliAnalyzeResult, triggerBiliAnalyze, saveBiliProfile,
 } from "../services/api";
 import type { BiliUserInfo, BiliAnalyzeResult, BiliContentItem } from "../types";
 
@@ -118,6 +118,15 @@ export default function CheckIdentity() {
     if (uidNum) loadResult(uidNum, pageInfo.current);
   }, [uid, loadResult]);
 
+  const handleSave = useCallback(async () => {
+    const uidNum = parseInt(uid.trim());
+    if (!uidNum) return;
+    try {
+      const res = await saveBiliProfile(uidNum);
+      MessagePlugin.success(res.message || "已存储");
+    } catch (e: any) { MessagePlugin.error(e.message || "存储失败"); }
+  }, [uid]);
+
   const handleRefetch = useCallback(async () => {
     const uidNum = parseInt(uid.trim()); if (!uidNum) return;
     setAnalyzing(true); setResult(null);
@@ -175,7 +184,10 @@ export default function CheckIdentity() {
               <span className="text-gray-500 text-xs">评论 {totalComments} · 视频/专栏 {contentCount} · 命中 {matchedCount}</span>
             </div>
           </div>
-          <Tooltip content="重新分析"><Button variant="outline" shape="square" icon={<RefreshIcon />} onClick={handleRefetch} disabled={analyzing} size="small" /></Tooltip>
+          <div className="flex items-center gap-2 shrink-0">
+            {result?.status === "done" && <Button size="small" variant="outline" onClick={handleSave}>存储数据</Button>}
+            <Tooltip content="重新分析"><Button variant="outline" shape="square" icon={<RefreshIcon />} onClick={handleRefetch} disabled={analyzing} size="small" /></Tooltip>
+          </div>
         </div>
       )}
 
@@ -229,7 +241,7 @@ export default function CheckIdentity() {
                 )}
                 {result.total_pages && result.total_pages > 1 && (
                   <div className="flex justify-center pt-4 pb-2">
-                    <Pagination current={page} total={totalComments} pageSize={100} onChange={handlePageChange} showPageSize={false} showJumper theme="primary" />
+                    <Pagination current={page} total={totalComments} pageSize={100} onChange={handlePageChange} showPageSize={false} showJumper />
                   </div>
                 )}
               </div>

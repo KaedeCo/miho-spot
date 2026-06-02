@@ -68,12 +68,35 @@ export default function Dashboard() {
     setCrawlingSearch(true);
     try {
       await triggerSearchCrawl();
-      await waitFor(async () => { const s = await getCrawlStatus(); return s.searchTotal > 0; });
+      // Poll for completion or error (Tophub is separate — no AICU retry logic)
+      const ok = await waitFor(async () => {
+        const s = await getCrawlStatus();
+        if (s.searchError) throw new Error(`TOPHUB_ERR:${s.searchErrorCode}:${s.searchError}`);
+        return s.searchTotal > 0;
+      });
+      if (!ok) {
+        // Timed out — check if error was set
+        const s = await getCrawlStatus();
+        if (s.searchError) {
+          MessagePlugin.error(`Tophub 搜索失败 [${s.searchErrorCode}]: ${s.searchError}`);
+          return;
+        }
+        MessagePlugin.warning("搜索超时（60秒），请检查网络或API Key");
+        return;
+      }
       await loadData();
       await checkToday(); await checkDeepSeek();
       MessagePlugin.success("热点搜索完成");
     }
-    catch { MessagePlugin.warning("后端未连接"); }
+    catch (e: any) {
+      const msg = String(e?.message || e);
+      if (msg.startsWith("TOPHUB_ERR:")) {
+        const parts = msg.split(":");
+        MessagePlugin.error(`Tophub 搜索失败 [${parts[1]}]: ${parts.slice(2).join(":")}`);
+      } else {
+        MessagePlugin.error(msg || "搜索请求失败，请检查后端连接");
+      }
+    }
     finally { setCrawlingSearch(false); }
   };
 

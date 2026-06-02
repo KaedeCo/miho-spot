@@ -157,10 +157,38 @@ export interface BiliContentItem {
 
 export interface BiliSpectrum {
   score: number;
+  score_x?: number;
+  score_y?: number;
   mihoyo_attitude: string;
   active_areas: string;
   personality: string;
   summary: string;
+}
+
+export interface BiliProfileSummary {
+  uid: number;
+  name: string;
+  face: string;
+  score_x: number;
+  score_y: number;
+  summary: string;
+  saved_at: string;
+}
+
+export interface BiliProfileDetail extends BiliProfileSummary {
+  mihoyo_attitude: string;
+  active_areas: string;
+  personality: string;
+}
+
+export interface BiliProfileItems {
+  ok: boolean;
+  uid: number;
+  items: any[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
 }
 
 export interface BiliAnalyzeStatus {

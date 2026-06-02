@@ -1,4 +1,4 @@
-import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult } from "../types";
+import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult, BiliProfileSummary, BiliProfileDetail, BiliProfileItems } from "../types";
 
 const BASE_URL = "/api";
 
@@ -183,4 +183,29 @@ export async function triggerBiliAnalyze(uid: number, maxVideos: number = 50, ma
     method: "POST",
     body: JSON.stringify({ uid, max_videos: maxVideos, max_comments_per_video: maxComments, months_limit: monthsLimit }),
   });
+}
+
+// Bilibili save & profiles
+export async function saveBiliProfile(uid: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON("/bilibili/save", { method: "POST", body: JSON.stringify({ uid }) });
+}
+
+export async function getBiliProfiles(): Promise<{ ok: boolean; profiles: BiliProfileSummary[] }> {
+  return fetchJSON("/bilibili/profiles");
+}
+
+export async function getBiliProfile(uid: number, tab: string = "comments", page: number = 1): Promise<BiliProfileDetail & BiliProfileItems> {
+  return fetchJSON(`/bilibili/profile/${uid}?tab=${tab}&page=${page}`);
+}
+
+export async function deleteBiliProfile(uid: number): Promise<{ ok: boolean }> {
+  return fetchJSON(`/bilibili/profile/${uid}`, { method: "DELETE" });
+}
+
+export async function exportBiliProfiles(): Promise<Response> {
+  return fetch("/api/bilibili/export");
+}
+
+export async function importBiliProfiles(profiles: any[]): Promise<{ ok: boolean; imported: number; updated: number; total: number; message: string }> {
+  return fetchJSON("/bilibili/import", { method: "POST", body: JSON.stringify({ profiles, mode: "merge" }) });
 }
