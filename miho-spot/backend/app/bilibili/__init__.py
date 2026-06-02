@@ -74,6 +74,98 @@ async def get_user_info(uid: int) -> dict:
     }
 
 
+async def fetch_user_content(uid: int) -> List[dict]:
+    """
+    Fetch user's published videos & articles.
+    - Videos: UAPIPRO API (free, no auth)
+    - Articles: B站 x/space/article (simple GET, works with curl_cffi)
+    Returns unified list sorted by time desc.
+    """
+    import asyncio
+    content = []
+    print(f"[Bilibili] Fetching content for uid={uid}...")
+
+    # 1) Fetch videos via UAPIPRO
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://uapis.cn/api/v1/social/bilibili/archives",
+                params={"mid": uid, "ps": "50", "pn": "1"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                videos = data.get("videos", []) or []
+                for v in videos:
+                    content.append({
+                        "type": "video",
+                        "id": v.get("aid", ""),
+                        "title": v.get("title", ""),
+                        "bvid": v.get("bvid", ""),
+                        "url": f"https://www.bilibili.com/video/{v.get('bvid', 'av'+str(v.get('aid','')))}",
+                        "time": v.get("create_time", v.get("publish_time", 0)),
+                        "time_str": "",
+                        "play": v.get("play_count", 0),
+                        "duration": v.get("duration", 0),
+                        "cover": v.get("cover", ""),
+                    })
+                print(f"[Bilibili] UAPIPRO videos: {len(videos)}")
+            else:
+                print(f"[Bilibili] UAPIPRO HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"[Bilibili] UAPIPRO error: {e}")
+
+    # 2) Fetch articles via B站 API (works with curl_cffi, simple endpoint)
+    try:
+        data = await asyncio.to_thread(
+            _aicu_get_simple,
+            "https://api.bilibili.com/x/space/article",
+            {"mid": uid, "pn": "1", "ps": "50", "sort": "publish_time"}
+        )
+        articles = data.get("articles", []) or []
+        for a in articles:
+            content.append({
+                "type": "article",
+                "id": a.get("id", ""),
+                "title": a.get("title", ""),
+                "bvid": "",
+                "url": f"https://www.bilibili.com/read/cv{a.get('id','')}",
+                "time": a.get("publish_time", a.get("ctime", 0)),
+                "time_str": "",
+                "play": a.get("view", {}).get("view", 0) if isinstance(a.get("view"), dict) else a.get("stats", {}).get("view", 0),
+                "duration": 0,
+                "cover": "",
+            })
+        print(f"[Bilibili] Articles: {len(articles)}")
+    except Exception as e:
+        print(f"[Bilibili] Articles error: {e}")
+
+    # Format times
+    for c in content:
+        if c["time"]:
+            c["time_str"] = datetime.fromtimestamp(c["time"]).strftime("%Y-%m-%d %H:%M:%S")
+
+    content.sort(key=lambda c: c["time"] or 0, reverse=True)
+    print(f"[Bilibili] Total content: {len(content)} items ({sum(1 for c in content if c['type']=='video')} videos, {sum(1 for c in content if c['type']=='article')} articles)")
+    return content
+
+
+def _aicu_get_simple(url: str, params: dict = None) -> dict:
+    """Simple curl_cffi GET for B站 endpoints (not AICU)."""
+    if params is None:
+        params = {}
+    resp = cffi_requests.get(
+        url, params=params,
+        headers={"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"},
+        impersonate="chrome131", timeout=20
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"API error (code={data.get('code')}): {data.get('message','?')}")
+    return data.get("data", {})
+
+
 async def fetch_user_video_comments(
     uid: int, max_videos: int = 50,
     max_comments_per_video: int = 500,
@@ -188,24 +280,21 @@ def filter_comments_by_keywords(comments: List[dict]) -> List[dict]:
 
 # ---- DeepSeek Personality Analysis ----
 
-async def analyze_user_personality(all_comments: List[dict], matched_comments: List[dict], api_key: str) -> dict:
+async def analyze_user_personality(all_comments: List[dict], matched_comments: List[dict],
+                                     api_key: str, user_content: List[dict] = None) -> dict:
     """
-    Analyze user personality from their comments via DeepSeek.
-    Uploads ALL keyword-matched comments + latest comments (totaling 100).
-    Returns: {"mihoyo_attitude": str, "active_areas": str, "personality": str, "score": int}
+    Analyze user personality from comments + video/article titles via DeepSeek.
+    Uploads up to 100 keyword-matched comments + latest comments + up to 100 content titles.
     """
     import asyncio
 
     if not api_key or not all_comments:
         return {
-            "score": 50,
-            "mihoyo_attitude": "无评论数据",
-            "active_areas": "未知",
-            "personality": "无法分析",
-            "summary": "该用户无评论数据",
+            "score": 50, "mihoyo_attitude": "无评论数据", "active_areas": "未知",
+            "personality": "无法分析", "summary": "该用户无评论数据",
         }
 
-    # Combine: all keyword-matched + fill with latest by time to reach 100
+    # Combine comments: keyword-matched + fill to 100 with latest
     matched_set = {c["rpid"] for c in matched_comments if c.get("rpid")}
     combined = list(matched_comments)
     for c in all_comments:
@@ -215,39 +304,53 @@ async def analyze_user_personality(all_comments: List[dict], matched_comments: L
             combined.append(c)
             matched_set.add(c.get("rpid"))
 
-    print(f"[DeepSeek-Personality] Uploading {len(combined)} comments (matched={len(matched_comments)}, total={len(all_comments)})")
+    # Build text blocks
+    blocks = []
 
-    max_chars = 8000
-    comments_texts = []
-    total_chars = 0
-    for c in combined:
-        kw_tags = ""
-        if c.get("matched_keywords"):
-            kw_tags = f" [命中: {','.join(c['matched_keywords'][:5])}]"
-        line = f"[{c.get('time_str', '')}]{kw_tags} {c.get('content', '')}"
-        if total_chars + len(line) > max_chars:
-            break
-        comments_texts.append(line)
-        total_chars += len(line)
+    # Content section (video/article titles)
+    if user_content:
+        content_items = user_content[:100]
+        titles = [f"[{c.get('time_str','')}] [{c.get('type','')}] {c.get('title','')}" for c in content_items if c.get('title')]
+        if titles:
+            blocks.append("【视频与专栏标题（反映用户创作方向）】\n" + "\n".join(titles))
 
-    joined_text = "\n\n".join(comments_texts)
+    # Comments section
+    if combined:
+        comments_texts = []
+        total_chars = 0
+        for c in combined:
+            kw_tags = ""
+            if c.get("matched_keywords"):
+                kw_tags = f" [命中: {','.join(c['matched_keywords'][:5])}]"
+            line = f"[{c.get('time_str', '')}]{kw_tags} {c.get('content', '')}"
+            if total_chars + len(line) > 8000:
+                break
+            comments_texts.append(line)
+            total_chars += len(line)
+        blocks.append("【评论记录（反映用户互动风格）】\n" + "\n".join(comments_texts))
 
-    prompt = f"""你是一个专业的用户画像分析师。请根据以下B站用户的评论记录，分析该用户的人格特征。
+    joined_text = "\n\n".join(blocks)
+    print(f"[DeepSeek-Personality] Uploading {len(combined)} comments + {len(user_content or [])} content titles")
+
+    prompt = f"""你是一个专业的用户画像分析师。请根据以下B站用户的创作内容和评论记录，分析该用户的人格特征。
 
 分析维度：
 1. 对米哈游游戏的态度：请分析该用户对米哈游（原神、星穹铁道、绝区零、崩坏等）的总体态度。描述其是支持还是反对，情绪倾向如何，并给出0-100的分数（0=极度反对，50=中立，100=极度支持）。
-2. 主要活跃领域：根据评论内容推断该用户活跃的游戏圈子、讨论话题和关注点。
-3. 性格推测：根据语言风格、互动方式推断该用户可能的人格类型和特点。
+2. 主要活跃领域：根据视频/专栏标题和评论内容，推断该用户活跃的游戏圈子、创作方向和关注点。
+3. 性格推测：根据语言风格、互动方式、创作倾向推断该用户可能的人格类型和特点。
 
-请注意：标记了[命中]的评论表示提到了米哈游相关关键词，是重点分析对象。
+请注意：
+- 视频和专栏标题反映用户的创作方向（UP主身份）
+- 评论记录反映用户的互动风格和社区参与
+- 标记了[命中]的评论表示提到了米哈游相关关键词，是重点分析对象
 
-用户评论记录：
+用户数据：
 ---
 {joined_text}
 ---
 
 请严格按照以下JSON格式回复（不要添加任何其他文字）：
-{{"score": 0到100的整数, "mihoyo_attitude": "对米哈游态度的详细分析（100字以内）", "active_areas": "主要活跃领域推断（80字以内）", "personality": "性格推测（100字以内）", "summary": "一句话总结（20字以内）"}}"""
+{{"score": 0到100的整数, "mihoyo_attitude": "对米哈游态度的详细分析（100字以内）", "active_areas": "主要活跃领域推断（100字以内）", "personality": "性格推测（100字以内）", "summary": "一句话总结（20字以内）"}}"""
 
     try:
         async with httpx.AsyncClient() as client:

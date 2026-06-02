@@ -142,6 +142,19 @@ export interface BiliComment {
   matched_categories?: string[];
 }
 
+export interface BiliContentItem {
+  type: "video" | "article";
+  id: string;
+  title: string;
+  bvid: string;
+  url: string;
+  time: number;
+  time_str: string;
+  play: number;
+  duration: number;
+  cover: string;
+}
+
 export interface BiliSpectrum {
   score: number;
   mihoyo_attitude: string;
@@ -169,6 +182,8 @@ export interface BiliAnalyzeResult {
   total_comments?: number;
   matched_count?: number;
   comments?: BiliComment[];
+  user_content?: BiliContentItem[];
+  content_count?: number;
   page?: number;
   page_size?: number;
   total_pages?: number;

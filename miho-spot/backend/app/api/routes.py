@@ -1325,7 +1325,7 @@ def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_
         print(f"[BiliAnalyze] Starting analysis for uid={uid}")
         loop = _asyncio_mod.new_event_loop()
         _asyncio_mod.set_event_loop(loop)
-        from app.bilibili import fetch_user_video_comments, filter_comments_by_keywords, analyze_user_personality, get_user_info
+        from app.bilibili import fetch_user_video_comments, fetch_user_content, filter_comments_by_keywords, analyze_user_personality, get_user_info
         print(f"[BiliAnalyze] Fetching user info...")
         user_info = loop.run_until_complete(get_user_info(uid))
         print(f"[BiliAnalyze] User: {user_info.get('name')}")
@@ -1335,8 +1335,10 @@ def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_
                                        max_comments_per_video=max_comments,
                                        months_limit=months_limit)
         )
+        print(f"[BiliAnalyze] Fetching video/articles...")
+        user_content = loop.run_until_complete(fetch_user_content(uid))
         loop.close()
-        print(f"[BiliAnalyze] Got {len(all_comments)} comments total")
+        print(f"[BiliAnalyze] Got {len(all_comments)} comments, {len(user_content)} content items")
 
         # Filter by keywords (for marking, not for exclusion)
         print(f"[BiliAnalyze] Filtering by keywords...")
@@ -1351,7 +1353,7 @@ def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_
             print(f"[BiliAnalyze] Calling DeepSeek for personality analysis...")
             loop2 = _asyncio_mod.new_event_loop()
             _asyncio_mod.set_event_loop(loop2)
-            spectrum = loop2.run_until_complete(analyze_user_personality(all_comments, matched_comments, ds_key))
+            spectrum = loop2.run_until_complete(analyze_user_personality(all_comments, matched_comments, ds_key, user_content))
             loop2.close()
             print(f"[BiliAnalyze] DeepSeek result: score={spectrum.get('score')}, summary={spectrum.get('summary')}")
         elif ds_key and not all_comments:
@@ -1371,8 +1373,10 @@ def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_
             "user_info": user_info,
             "total_comments": len(all_comments),
             "matched_count": len(matched_comments),
-            "all_comments": all_comments,           # ALL comments for display
-            "comments": matched_comments,            # keyword-matched subset
+            "all_comments": all_comments,
+            "comments": matched_comments,
+            "user_content": user_content,
+            "content_count": len(user_content),
             "spectrum": spectrum,
             "analyzed_at": datetime.utcnow().isoformat(),
         }
@@ -1452,6 +1456,8 @@ async def get_bili_analyze_result(uid: int, page: int = 1, page_size: int = 100)
         "total_comments": result.get("total_comments", 0),
         "matched_count": result.get("matched_count", 0),
         "comments": paged_comments,
+        "user_content": result.get("user_content", []),
+        "content_count": result.get("content_count", 0),
         "page": page,
         "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size),
