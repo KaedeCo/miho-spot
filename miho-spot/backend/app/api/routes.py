@@ -433,11 +433,38 @@ async def get_dashboard():
     global _search_cache
     all_topics = []
 
-    # Fallback: if caches are empty, try loading from persisted files
+    # Fallback 1: if caches are empty, try loading from persisted JSON files
     if not any(len(v) for v in _search_cache.values()):
         _load_today_search_to_cache()
     if not any(len(v) for v in _hot_cache.values()):
         _load_hot_crawl_from_file()
+
+    # Fallback 2: if caches are still empty after file restore, rebuild from latest daily_stats DB record
+    if not any(len(v) for v in _hot_cache.values()) and not any(len(v) for v in _search_cache.values()):
+        try:
+            db = SessionLocal()
+            latest = db.query(DailyStatsModel).order_by(DailyStatsModel.date.desc()).first()
+            if latest and latest.total_topics > 0:
+                # Rebuild hot_topics from DB
+                topics = db.query(HotTopicModel).filter(
+                    HotTopicModel.fetched_at >= datetime.utcnow() - timedelta(days=3)
+                ).limit(300).all()
+                if topics:
+                    for t in topics:
+                        p = t.platform or "other"
+                        if p not in _hot_cache:
+                            _hot_cache[p] = []
+                        _hot_cache[p].append({
+                            "id": t.id, "platform": t.platform, "title": t.title,
+                            "rank": t.rank or 0, "heat": float(t.heat or 0),
+                            "url": t.url or "", "fetched_at": (t.fetched_at or "").isoformat() if t.fetched_at else "",
+                            "sentiment": t.sentiment or "Neutral",
+                            "related_game": t.related_game, "is_game_related": bool(t.is_game_related),
+                        })
+                    print(f"[Dashboard] Fallback: rebuilt {_hot_cache} items ({sum(len(v) for v in _hot_cache.values())} total) from DB")
+            db.close()
+        except Exception as e:
+            print(f"[Dashboard] DB fallback failed: {e}")
 
     # Ensure daily stats exist in DB (for history page after restart)
     try:
@@ -944,8 +971,130 @@ async def get_topic_analysis(topic_id: str):
         db.close()
 
 
+def _build_stats_from_json(date_str: str) -> Optional[dict]:
+    """Build daily stats dict from the tophub_search JSON file for a given date (YYYYMMDD)."""
+    data_dir = _get_search_data_dir()
+    filepath = data_dir / f"{date_str}.json"
+    if not filepath.exists():
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            jdata = json.load(f)
+        items = jdata.get("parsed_items", [])
+        if not items:
+            return None
+        game_related = [i for i in items if i.get("is_game_related")]
+        all_platforms = set(i.get("platform", "other") for i in items)
+        by_platform = {}
+        for p in all_platforms:
+            pi = [i for i in items if i.get("platform") == p]
+            by_platform[p] = {
+                "total": len(pi),
+                "positive": sum(1 for i in pi if i.get("sentiment") == "Positive"),
+                "negative": sum(1 for i in pi if i.get("sentiment") == "Negative"),
+                "neutral": sum(1 for i in pi if i.get("sentiment") == "Neutral"),
+                "irrelevant": sum(1 for i in pi if i.get("sentiment") == "Irrelevant"),
+            }
+        # Also merge hot_crawl.json
+        hot_file = data_dir / "hot_crawl.json"
+        extra_items = []
+        if hot_file.exists():
+            try:
+                with open(hot_file, "r", encoding="utf-8") as f:
+                    hlist = json.load(f)
+                extra_items = hlist if isinstance(hlist, list) else []
+            except Exception:
+                pass
+
+        total = len(items) + len(extra_items)
+        extra_game = [i for i in extra_items if i.get("is_game_related")]
+        all_items = items + extra_items
+
+        for i in extra_items:
+            p = i.get("platform", "other")
+            if p not in by_platform:
+                by_platform[p] = {"total": 0, "positive": 0, "negative": 0, "neutral": 0, "irrelevant": 0}
+            by_platform[p]["total"] += 1
+            s = i.get("sentiment", "")
+            if s in by_platform[p]:
+                by_platform[p][s] += 1
+
+        all_game = game_related + extra_game
+        return {
+            "date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
+            "totalTopics": total,
+            "gameRelated": len(all_game),
+            "positive": sum(1 for i in all_game if i.get("sentiment") == "Positive"),
+            "negative": sum(1 for i in all_game if i.get("sentiment") == "Negative"),
+            "neutral": sum(1 for i in all_game if i.get("sentiment") == "Neutral"),
+            "irrelevant": sum(1 for i in all_items if i.get("sentiment") == "Irrelevant"),
+            "byPlatform": by_platform,
+        }
+    except Exception as e:
+        print(f"[stats/daily] Error reading {filepath}: {e}")
+        return None
+
+
+def sync_daily_stats_from_json():
+    """Scan all tophub_search/*.json files and upsert daily_stats into DB.
+    Call this once at startup so that /api/stats/daily can be a fast DB-only query."""
+    data_dir = _get_search_data_dir()
+    if not data_dir.exists():
+        print("[StatsSync] Data dir not found, skipping")
+        return 0
+
+    json_files = sorted(data_dir.glob("*.json"))
+    # Exclude non-date files like hot_crawl.json (8-digit numeric names only)
+    date_files = [f for f in json_files if f.stem.isdigit() and len(f.stem) == 8]
+
+    db = SessionLocal()
+    synced = 0
+    try:
+        for fpath in date_files:
+            date_str = fpath.stem  # e.g. "20260602"
+            stat = _build_stats_from_json(date_str)
+            if not stat:
+                continue
+            date_iso = stat["date"]  # "2026-06-02"
+
+            existing = db.query(DailyStatsModel).filter(DailyStatsModel.date == date_iso).first()
+            if existing:
+                # Update only if totals differ (avoid unnecessary writes)
+                if existing.total_topics != stat["totalTopics"] or existing.game_related != stat["gameRelated"]:
+                    existing.total_topics = stat["totalTopics"]
+                    existing.game_related = stat["gameRelated"]
+                    existing.positive = stat["positive"]
+                    existing.negative = stat["negative"]
+                    existing.neutral = stat["neutral"]
+                    existing.irrelevant = stat["irrelevant"]
+                    existing.by_platform = stat["byPlatform"]
+                    synced += 1
+            else:
+                db.add(DailyStatsModel(
+                    date=date_iso,
+                    total_topics=stat["totalTopics"],
+                    game_related=stat["gameRelated"],
+                    positive=stat["positive"],
+                    negative=stat["negative"],
+                    neutral=stat["neutral"],
+                    irrelevant=stat["irrelevant"],
+                    by_platform=stat["byPlatform"],
+                ))
+                synced += 1
+        db.commit()
+    except Exception as e:
+        print(f"[StatsSync] Error: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+    print(f"[StatsSync] Synced {synced} days from {len(date_files)} JSON files")
+    return synced
+
+
 @router.get("/stats/daily")
 async def get_daily_stats(range: str = "7d", start: Optional[str] = None, end: Optional[str] = None):
+    """Return daily stats from DB (populated at startup from JSON files)."""
     db = SessionLocal()
     try:
         q = db.query(DailyStatsModel)

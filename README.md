@@ -2,11 +2,49 @@
 
 > "从此以后，每个人都是社管，亦或者都不是社管。" — By Chronostasis
 
-**v1.1**
+**v1.2**
 
 Miho-spot 是一个多平台二游圈舆情监测与分析系统，覆盖知乎、抖音、贴吧、B站等平台。通过热搜爬取、关键词匹配、SnowNLP 本地情感分析、DeepSeek AI 增强分析，实时追踪米哈游相关舆论风向。
 
-新增 **B站"查成分"** 功能：输入任意 B站用户 UID，自动拉取其历史评论，经关键词筛选后由 DeepSeek 生成用户人格画像（米哈游态度、活跃领域、性格推测），为社区舆情研究提供数据支撑。
+### v1.2 更新重点（2026-06-02）：历史统计数据修复
+
+**问题背景**：v1.1 中「历史统计」页面显示的数据不完整（如某日 total=100 而实际应有 ~409 条）。根因是 `_sync_daily_stats()` 仅在搜索执行/DeepSeek 分析时从内存缓存写入 DB，若当时内存缓存不完整（例如程序中途重启、缓存被清理），DB 中该日的统计就会永久丢失。
+
+**修复方案 — JSON 源文件优先架构**：
+- **新增启动同步机制**：程序每次启动时自动扫描 `data/tophub_search/` 目录下的所有日期 JSON 文件（格式 `YYYYMMDD.json`，如 `20260602.json`）
+- **逐日重建统计**：从每个 JSON 的 `parsed_items` 字段完整计算 totalTopics、gameRelated、positive/negative/neutral/irrelevant 及各平台分布 byPlatform
+- **合并热搜数据**：每日统计同时包含关键词搜索数据（来自日期 JSON）和热榜爬取数据（来自 `hot_crawl.json`），两者合并为当日完整统计
+- **智能 Upsert**：对比 DB 现有记录，仅在数值不一致时才更新（避免无意义的写操作）；新日期直接插入
+- **API 回归纯 DB 查询**：`/api/stats/daily` 端点恢复为简单的 SQLite 查询，响应速度快且不依赖运行时缓存
+
+**数据流变化（修复前 → 修复后）**：
+
+| 阶段 | 修复前 | 修复后 |
+|------|--------|--------|
+| 数据源 | 内存缓存（不可靠） | JSON 文件（持久化，ground truth）|
+| 写入时机 | 搜索/分析触发时（可能遗漏） | 每次启动必执行（完整覆盖）|
+| API 读取 | DB（可能不完整） | DB（已由 JSON 同步补全）|
+| 容错能力 | 缓存丢失 = 数据永久缺失 | 重启即可自动修复 |
+
+**验证结果**（dist/data/miho_spot.db）：
+
+| 日期 | 修复前 total | 修复后 total | gameRelated | positive |
+|------|-------------|-------------|-------------|----------|
+| 2026-05-31 | 100 ❌ | **409** ✅ | 137 | 57 |
+| 2026-06-01 | 100 ❌ | **409** ✅ | 136 | 56 |
+| 2026-06-02 | 250 ⚠️ | **409** ✅ | 135 | 51 |
+
+> 注：每日 409 条 ≈ 150 条付费搜索 parsed_items + 259 条 hot_crawl 热搜数据
+
+**涉及修改的文件**：
+- `miho-spot/backend/app/api/routes.py` — 新增 `sync_daily_stats_from_json()` 启动同步函数 + `_build_stats_from_json()` JSON 统计计算函数；重构 `/api/stats/daily` 端点回归 DB-only 查询
+- `miho-spot-desktop/main.py` — 在 FastAPI 启动流程中 `init_db()` 之后调用 `sync_daily_stats_from_json()`
+
+**之前版本功能保留**：
+- B站"查成分"功能（v1.1）：UID 输入 → 历史评论拉取 → 关键词筛选 → DeepSeek 人格画像
+- 多平台热搜爬取（v1.0）：知乎、抖音、贴吧热榜 + Tophub 付费关键词搜索
+- 200+ 关键词词典 + SnowNLP / DeepSeek 双引擎情感分析
+- PyQt6 暗黑 GUI + PyInstaller 单文件打包
 
 ---
 
@@ -158,6 +196,14 @@ miho-spot/
 ---
 
 ## 更新日志
+
+### v1.2 (2026-06-02) — 历史统计数据修复
+- **修复历史统计页面数据不完整问题**：5/31、6/1 等日期 total 仅 100 条，实际应有 ~409 条
+- **根因分析**：`_sync_daily_stats()` 从内存缓存写入 DB，缓存不完整时数据永久丢失
+- **新增启动同步机制**：每次程序启动时扫描 `tophub_search/*.json` 文件，重建 `daily_stats` 表（JSON → DB）
+- **智能 Upsert**：对比 DB 现有记录，仅数值不一致时更新；新日期直接插入
+- **API 端点回归**：`/api/stats/daily` 恢复为纯 DB 查询（快速可靠）
+- **完整数据流**：每日统计 = 付费搜索 JSON parsed_items + hot_crawl.json 热搜合并
 
 ### v1.1 (2026-06)
 - 新增 B站"查成分"功能：UID 输入 → 历史评论拉取 → 关键词筛选 → DeepSeek 人格画像

@@ -219,6 +219,14 @@ class BackendGUI(QMainWindow):
         _cr.TOPHUB_API_KEY = ""
 
         init_db()
+
+        # Sync daily_stats DB from JSON files (ground truth) so history is always complete
+        try:
+            from app.api.routes import sync_daily_stats_from_json
+            sync_daily_stats_from_json()
+        except Exception as e:
+            print(f"[Miho-spot] Stats sync error: {e}", file=sys.stderr)
+
         # Seed platform entries WITHOUT pre-filled API keys (release policy)
         db = SessionLocal()
         try:
