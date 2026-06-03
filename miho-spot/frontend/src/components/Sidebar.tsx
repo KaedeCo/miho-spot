@@ -11,6 +11,9 @@ import {
   LocationIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  PlayCircleIcon,
+  CloudIcon,
+  FileSearchIcon,
 } from "tdesign-icons-react";
 
 const menuItems = [
@@ -20,6 +23,9 @@ const menuItems = [
   { path: "/history", label: "历史统计", icon: <HistoryIcon /> },
   { path: "/identity", label: "查成分", icon: <SearchIcon /> },
   { path: "/spectrum", label: "二维光谱图", icon: <LocationIcon /> },
+  { path: "/video-analysis", label: "视频分析", icon: <PlayCircleIcon /> },
+  { path: "/word-cloud", label: "词云", icon: <CloudIcon /> },
+  { path: "/deep-analysis", label: "深度分析", icon: <FileSearchIcon /> },
   { path: "/accounts", label: "账号管理", icon: <SettingIcon /> },
 ];
 

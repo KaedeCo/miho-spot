@@ -45,9 +45,24 @@ export default function HotTopics() {
 
   const handleSearchCrawl = async () => {
     setCrawlingSearch(true);
-    try { await triggerSearchCrawl(); await waitFor(async () => { const s = await getCrawlStatus(); return s.searchTotal > 0; }); await loadTopics(); MessagePlugin.success("完成"); }
-    catch { MessagePlugin.warning("后端未连接"); }
-    finally { setCrawlingSearch(false); }
+    try {
+      await triggerSearchCrawl();
+      const ok = await waitFor(async () => {
+        const s = await getCrawlStatus();
+        if (s.searchError) throw new Error(s.searchError);  // stop on error
+        return s.searchTotal > 0;
+      });
+      if (ok) {
+        await loadTopics();
+        MessagePlugin.success("完成");
+      } else {
+        MessagePlugin.warning("搜索超时，请重试");
+      }
+    } catch (e: any) {
+      MessagePlugin.warning(e?.message || "后端未连接");
+    } finally {
+      setCrawlingSearch(false);
+    }
   };
 
   const allPlatforms = [...new Set(topics.map(t => t.platform))];
@@ -93,7 +108,7 @@ export default function HotTopics() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((topic, idx) => (
             <div
-              key={topic.id}
+              key={topic.id ? `topic-${topic.id}` : `idx-${idx}`}
               className="glass-card p-4 animate-fade-in-up opacity-0"
               style={{ animationDelay: `${idx * 0.03}s`, animationFillMode: "forwards" }}
             >

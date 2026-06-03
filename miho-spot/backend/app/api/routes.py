@@ -4,6 +4,7 @@ Miho-spot Backend API Routes - Hot crawl + Keyword search
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
+from sqlalchemy import func as _sql_func
 from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,7 +13,8 @@ import hashlib
 import json
 
 from app.models import get_db, SessionLocal, init_db
-from app.models import HotTopicModel, PostItemModel, DailyStatsModel, KeywordModel, AccountModel, BiliUserProfile
+from app.models import HotTopicModel, PostItemModel, DailyStatsModel, KeywordModel, AccountModel, BiliUserProfile, VideoAnalysisTask, VideoComment
+from app.models import SavedVaTask, WordCloudItem, DeepAnalysis, IdentityQueue
 from app.crawlers import get_crawler
 
 router = APIRouter(prefix="/api")
@@ -43,6 +45,7 @@ _search_time: Optional[datetime] = None
 # Search error state (separate from AICU/Bilibili)
 _search_error: Optional[str] = None
 _search_error_code: Optional[str] = None
+_search_running: bool = False
 
 # User-configurable search keywords - persist in module-level
 _search_keywords: Optional[List[str]] = None  # Lazy init from DB or default
@@ -256,11 +259,12 @@ def _load_today_search_to_cache() -> bool:
 
 def _run_keyword_search(keywords: List[str] = None):
     """Call Tophub /search API (paid endpoint) and persist results to local file immediately."""
-    global _search_cache, _search_time, _search_error, _search_error_code
+    global _search_cache, _search_time, _search_error, _search_error_code, _search_running
 
     # Reset error state at start
     _search_error = None
     _search_error_code = None
+    _search_running = True
 
     # Foolproof: check if today's data already exists
     if _check_today_search_exists():
@@ -288,6 +292,7 @@ def _run_keyword_search(keywords: List[str] = None):
             print(f"[Search] API returned error: code={code}, msg={msg}")
             _search_error = msg
             _search_error_code = f"TOPHUB_{code}"
+            _search_running = False
             return
 
         data = result.get("data", {})
@@ -343,6 +348,7 @@ def _run_keyword_search(keywords: List[str] = None):
         print(f"[Search] Error: {err_str}")
         _search_error = err_str[:200]
         _search_error_code = "SEARCH_EXCEPTION"
+        _search_running = False
         return
 
     # Analyze sentiment BEFORE persisting (so saved file has analyzed data)
@@ -362,6 +368,7 @@ def _run_keyword_search(keywords: List[str] = None):
     platforms = list(_search_cache.keys())
     _store_to_db(all_items, platforms)
     _search_time = datetime.utcnow()
+    _search_running = False
     print(f"[Search] Done: {len(all_items)} items across {len(platforms)} platforms")
 
 
@@ -519,9 +526,13 @@ async def get_topics(platform: Optional[str] = None, source: Optional[str] = Non
     all_p = list(set(list(_hot_cache.keys()) + list(_search_cache.keys())))
     platforms_to_use = all_p if not platform else [platform]
     result = []
+    seen = set()
     for p in platforms_to_use:
         items = cache.get(p, []) if source else _hot_cache.get(p, []) + _search_cache.get(p, [])
         for i in items:
+            if i["id"] in seen:
+                continue
+            seen.add(i["id"])
             result.append({
                 "id": i["id"], "platform": i["platform"], "title": i["title"],
                 "rank": i.get("rank", 0), "heat": i.get("heat", 0),
@@ -554,6 +565,15 @@ async def crawl_status():
     hot_total = sum(len(v) for v in _hot_cache.values())
     search_total = sum(len(v) for v in _search_cache.values())
     all_p = set(list(_hot_cache.keys()) + list(_search_cache.keys()))
+    # Determine search state: idle / running / done / error
+    if _search_running:
+        search_status = "running"
+    elif _search_error:
+        search_status = "error"
+    elif search_total > 0 or _search_time:
+        search_status = "done"
+    else:
+        search_status = "idle"
     return {
         "hasData": (hot_total + search_total) > 0,
         "hotTotal": hot_total, "searchTotal": search_total,
@@ -566,6 +586,7 @@ async def crawl_status():
         # Tophub-specific error state (separate from AICU)
         "searchError": _search_error,
         "searchErrorCode": _search_error_code,
+        "searchStatus": search_status,
     }
 
 
@@ -972,7 +993,11 @@ async def get_topic_analysis(topic_id: str):
 
 
 def _build_stats_from_json(date_str: str) -> Optional[dict]:
-    """Build daily stats dict from the tophub_search JSON file for a given date (YYYYMMDD)."""
+    """Build daily stats dict from the tophub_search JSON file for a given date (YYYYMMDD).
+
+    If parsed_items lack sentiment/is_game_related fields (raw crawl data),
+    backfill from the hot_topics DB table which may have analysed data.
+    """
     data_dir = _get_search_data_dir()
     filepath = data_dir / f"{date_str}.json"
     if not filepath.exists():
@@ -983,6 +1008,26 @@ def _build_stats_from_json(date_str: str) -> Optional[dict]:
         items = jdata.get("parsed_items", [])
         if not items:
             return None
+
+        # Backfill missing sentiment/is_game_related from hot_topics DB table
+        missing_ids = [i.get("id") for i in items if not i.get("sentiment") or i.get("is_game_related") is None]
+        if missing_ids:
+            db = SessionLocal()
+            try:
+                db_rows = db.query(HotTopicModel).filter(HotTopicModel.id.in_(missing_ids)).all()
+                db_map = {r.id: r for r in db_rows}
+                for item in items:
+                    rid = item.get("id")
+                    if rid in db_map:
+                        r = db_map[rid]
+                        if not item.get("sentiment"):
+                            item["sentiment"] = r.sentiment or "Neutral"
+                        if item.get("is_game_related") is None:
+                            item["is_game_related"] = r.is_game_related if r.is_game_related is not None else False
+            finally:
+                db.close()
+
+        # Also backfill extra_items (hot_crawl.json) from DB later
         game_related = [i for i in items if i.get("is_game_related")]
         all_platforms = set(i.get("platform", "other") for i in items)
         by_platform = {}
@@ -1007,6 +1052,25 @@ def _build_stats_from_json(date_str: str) -> Optional[dict]:
                 pass
 
         total = len(items) + len(extra_items)
+
+        # Backfill missing fields in extra_items from DB
+        extra_missing = [i.get("id") for i in extra_items if not i.get("sentiment") or i.get("is_game_related") is None]
+        if extra_missing:
+            db2 = SessionLocal()
+            try:
+                db_rows2 = db2.query(HotTopicModel).filter(HotTopicModel.id.in_(extra_missing)).all()
+                db_map2 = {r.id: r for r in db_rows2}
+                for item in extra_items:
+                    rid = item.get("id")
+                    if rid in db_map2:
+                        r = db_map2[rid]
+                        if not item.get("sentiment"):
+                            item["sentiment"] = r.sentiment or "Neutral"
+                        if item.get("is_game_related") is None:
+                            item["is_game_related"] = r.is_game_related if r.is_game_related is not None else False
+            finally:
+                db2.close()
+
         extra_game = [i for i in extra_items if i.get("is_game_related")]
         all_items = items + extra_items
 
@@ -1090,6 +1154,79 @@ def sync_daily_stats_from_json():
 
     print(f"[StatsSync] Synced {synced} days from {len(date_files)} JSON files")
     return synced
+
+
+def sync_hot_topics_from_json():
+    """Scan all tophub_search/*.json files (hot_crawl.json + YYYYMMDD.json) and 
+    upsert every item into hot_topics table. Call once at startup."""
+    data_dir = _get_search_data_dir()
+    if not data_dir.exists():
+        print("[TopicSync] Data dir not found, skipping")
+        return 0
+    
+    db = SessionLocal()
+    imported = 0
+    skipped = 0
+    try:
+        json_files = sorted(data_dir.glob("*.json"))
+        
+        for fpath in json_files:
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"[TopicSync] Skip {fpath.name}: {e}")
+                continue
+            
+            # Extract items based on file format
+            if isinstance(data, list):
+                items = data  # hot_crawl.json is a flat array
+            elif isinstance(data, dict) and "parsed_items" in data:
+                items = data["parsed_items"]  # YYYYMMDD.json has parsed_items
+            else:
+                continue
+            
+            for item in items:
+                item_id = item.get("id")
+                if not item_id:
+                    continue
+                existing = db.query(HotTopicModel).filter(HotTopicModel.id == item_id).first()
+                if existing:
+                    skipped += 1
+                    continue
+                # Parse fetched_at
+                fa_str = item.get("fetched_at", "")
+                fetched_at = datetime.utcnow()
+                if fa_str:
+                    try:
+                        fetched_at = datetime.fromisoformat(fa_str)
+                    except Exception:
+                        pass
+                db.add(HotTopicModel(
+                    id=item_id,
+                    platform=item.get("platform", "other"),
+                    title=item.get("title", ""),
+                    rank=item.get("rank", 0),
+                    heat=item.get("heat", 0),
+                    url=item.get("url", ""),
+                    fetched_at=fetched_at,
+                    sentiment=item.get("sentiment", "Neutral"),
+                    related_game=item.get("related_game"),
+                    is_game_related=item.get("is_game_related", False),
+                ))
+                imported += 1
+            
+            # Commit per-file to avoid massive transactions
+            db.commit()
+        
+    except Exception as e:
+        print(f"[TopicSync] Error: {e}")
+        db.rollback()
+    finally:
+        db.close()
+    
+    print(f"[TopicSync] Imported {imported} topics, skipped {skipped} duplicates from JSON files")
+    return imported
 
 
 @router.get("/stats/daily")
@@ -1296,7 +1433,22 @@ def _get_categories_path() -> Path:
 def _load_categories() -> dict:
     path = _get_categories_path()
     if not path.exists():
-        defaults = {"categories": {"mihoyo_game": {"name": "米哈游游戏", "order": 1}, "mihoyo_character": {"name": "米哈游角色", "order": 2}, "mihoyo_cv": {"name": "米哈游CV", "order": 3}, "competitor": {"name": "竞品游戏", "order": 4}, "general": {"name": "二游圈通用", "order": 5}}}
+        defaults = {"categories": {
+            "mihoyo_game": {"name": "米哈游游戏", "order": 1},
+            "mihoyo_character": {"name": "米哈游角色", "order": 2},
+            "mihoyo_cv": {"name": "米哈游CV", "order": 3},
+            "competitor": {"name": "竞品游戏", "order": 4},
+            "general": {"name": "二游圈通用", "order": 5},
+            "sentiment_neg": {"name": "负面情感词", "order": 6},
+            "sentiment_pos": {"name": "正面情感词", "order": 7},
+            "platform": {"name": "社区/平台术语", "order": 8},
+            "game_mechanic": {"name": "游戏系统/机制", "order": 9},
+            "player_group": {"name": "玩家群体/称呼", "order": 10},
+            "meme": {"name": "热梗/网络用语", "order": 11},
+            "industry": {"name": "行业/商业术语", "order": 12},
+            "acg": {"name": "二次元/ACG文化", "order": 13},
+            "bili_slang": {"name": "B站/视频圈用语", "order": 14},
+        }}
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(defaults, f, ensure_ascii=False, indent=2)
@@ -1936,9 +2088,1191 @@ async def import_bili_profiles(body: dict):
             "message": f"导入完成：新增 {imported}，更新 {updated}，共 {total} 个用户"}
 
 
+# ==================== Video Comment Analysis ====================
+
+import uuid as _uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_va_state: dict = {"task_id": None, "status": "idle", "progress": ""}  # simple state for polling
+
+def _parse_bilibili_url(url: str) -> tuple:
+    """Extract BVID from Bilibili URL. Returns (bvid, error_msg)."""
+    url = url.strip()
+    # Direct BV id
+    if url.startswith("BV") and len(url) >= 10:
+        return url, ""
+    # URL patterns
+    import re
+    m = re.search(r'BV[a-zA-Z0-9]+', url)
+    if m:
+        return m.group(0), ""
+    return "", f"无法从URL中提取BV号: {url}"
+
+
+def _bili_get_aid(bvid: str) -> tuple:
+    """Convert BVID to AID via Bilibili API. Returns (aid, title, cover, error)."""
+    import httpx
+    try:
+        resp = httpx.get(
+            f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return 0, "", "", f"API错误: {data.get('message', 'unknown')}"
+        d = data["data"]
+        return d["aid"], d.get("title", ""), d.get("pic", ""), ""
+    except Exception as e:
+        return 0, "", "", str(e)
+
+
+def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500) -> list:
+    """Fetch comments from Bilibili reply API.
+    mode=3: hot sort, mode=2: time sort.
+    Returns list of comment dicts including sub-replies."""
+    import httpx
+    import time as _time
+
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}
+    all_items = []
+    cursor = 0
+    page = 0
+
+    while len(all_items) < max_count:
+        page += 1
+        try:
+            resp = httpx.get(
+                "https://api.bilibili.com/x/v2/reply/main",
+                params={"type": 1, "oid": aid, "mode": mode, "next": cursor, "ps": 20},
+                headers=headers, timeout=15,
+            )
+            d = resp.json()
+        except Exception as e:
+            print(f"[Video-Fetch] Page {page} error: {e}")
+            break
+        if d.get("code") != 0:
+            print(f"[Video-Fetch] Page {page} API error: {d.get('message')}")
+            break
+
+        replies = d.get("data", {}).get("replies", [])
+        cur = d.get("data", {}).get("cursor", {})
+        is_end = cur.get("is_end", False)
+        cursor = cur.get("next", 0)
+
+        for r in replies:
+            if len(all_items) >= max_count:
+                break
+            m = r.get("member", {})
+            content_obj = r.get("content", {})
+            message = content_obj.get("message", "")
+            item = {
+                "rpid": r["rpid"], "parent_rpid": 0, "root_rpid": 0,
+                "uid": m.get("mid", 0), "user": m.get("uname", ""),
+                "content": message[:500], "like_count": r.get("like", 0),
+                "reply_count": r.get("rcount", 0),
+                "ctime": r.get("ctime", 0),
+                "sort_mode": "hot" if mode == 3 else "time",
+                "matched_keywords": [],
+            }
+            all_items.append(item)
+
+            # Fetch sub-replies for this main comment if any
+            rcount = r.get("rcount", 0)
+            if rcount > 0:
+                sub_replies = _bili_fetch_sub_replies(aid, r["rpid"], max_count - len(all_items))
+                all_items.extend(sub_replies)
+
+        if is_end or not cursor:
+            break
+        _time.sleep(0.4)
+
+    return all_items
+
+
+def _bili_fetch_sub_replies(aid: int, root_rpid: int, remaining: int) -> list:
+    """Fetch sub-replies for a given root comment."""
+    import httpx
+    import time as _time
+
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}
+    subs = []
+    pn = 1
+    ps = 20  # sub-replies per page
+
+    while True:
+        try:
+            resp = httpx.get(
+                "https://api.bilibili.com/x/v2/reply/reply",
+                params={"type": 1, "oid": aid, "root": root_rpid, "pn": pn, "ps": ps},
+                headers=headers, timeout=15,
+            )
+            d = resp.json()
+        except Exception as e:
+            print(f"[Video-Sub] Error fetching subs for root {root_rpid}: {e}")
+            break
+        if d.get("code") != 0:
+            break
+
+        replies = d.get("data", {}).get("replies", [])
+        for r in replies:
+            if len(subs) >= remaining:
+                return subs
+            m = r.get("member", {})
+            content_obj = r.get("content", {})
+            message = content_obj.get("message", "")
+            subs.append({
+                "rpid": r["rpid"], "parent_rpid": r.get("parent", 0), "root_rpid": root_rpid,
+                "uid": m.get("mid", 0), "user": m.get("uname", ""),
+                "content": message[:500], "like_count": r.get("like", 0),
+                "reply_count": 0, "ctime": r.get("ctime", 0),
+                "sort_mode": "hot",
+                "matched_keywords": [],
+            })
+
+        total = d.get("data", {}).get("page", {}).get("count", 0)
+        if pn * ps >= total or not replies:
+            break
+        pn += 1
+        _time.sleep(0.3)
+
+    return subs
+
+
+def _match_keywords_for_comment(content: str, keywords_dict: dict) -> list:
+    """Match comment against keyword dictionary. Returns list of matched keywords."""
+    if not content or not keywords_dict:
+        return []
+    matched = []
+    lower_content = content.lower()
+    for kw in keywords_dict:
+        if kw.lower() in lower_content:
+            matched.append(kw)
+    return matched
+
+
+def _deepseek_score_comment(content: str, api_key: str) -> tuple:
+    """Ask DeepSeek to score a comment on X,Y coordinates.
+    Returns (X, Y) or (-1, -1) on failure.
+    X: 0=anti-mihoyo, 100=pro-mihoyo
+    Y: 0=rational, 100=emotional"""
+    import httpx
+    prompt = f"""你是一个专业的舆情分析AI。请分析以下B站评论的情感坐标。
+
+坐标定义：
+- X轴（横轴，0-100）：0代表极度反对米哈游，50代表中立，100代表极度支持米哈游
+- Y轴（纵轴，0-100）：0代表极度理性客观，50代表中性，100代表极度感性情绪化
+
+规则：
+1. 只根据评论内容判断，不要过度解读
+2. 考虑用词、语气、表情符号、标点符号的使用
+3. 支持米哈游的正面评价 → X偏高（60-100）
+4. 反对/批评米哈游 → X偏低（0-40）
+5. 理性分析、讲道理、摆数据 → Y偏低（0-40）
+6. 感性表达、情绪宣泄、玩梗 → Y偏高（60-100）
+
+评论内容：
+{content[:400]}
+
+请只返回JSON格式：{{"X":数字,"Y":数字}}
+不要返回任何其他文字。"""
+
+    try:
+        resp = httpx.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 30,
+            },
+            timeout=25,
+        )
+        data = resp.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+        # Try parse JSON from response
+        import re
+        json_match = re.search(r'\{[^{}]*"X"\s*:\s*\d+[^{}]*"Y"\s*:\s*\d+[^{}]*\}', text)
+        if json_match:
+            coords = eval(json_match.group(0))  # safe enough for numeric JSON
+            x = max(0, min(100, int(coords.get("X", 50))))
+            y = max(0, min(100, int(coords.get("Y", 50))))
+            return x, y
+
+        # Fallback: look for two numbers
+        nums = re.findall(r'\d+', text)
+        if len(nums) >= 2:
+            x = max(0, min(100, int(nums[0])))
+            y = max(0, min(100, int(nums[1])))
+            return x, y
+
+        return -1, -1
+    except Exception as e:
+        print(f"[Video-DS] Score error: {e}")
+        return -1, -1
+
+
+@router.get("/video-analysis/tasks")
+async def va_list_tasks():
+    """List all video analysis tasks."""
+    db = SessionLocal()
+    try:
+        tasks = db.query(VideoAnalysisTask).order_by(VideoAnalysisTask.created_at.desc()).all()
+        return [{
+            "id": t.id, "bvid": t.bvid, "title": t.title, "status": t.status,
+            "totalComments": t.total_comments, "matchedCount": t.matched_count,
+            "analyzedCount": t.analyzed_count,
+            "centroidX": t.centroid_x, "centroidY": t.centroid_y,
+            "errorMsg": t.error_msg, "coverUrl": t.cover_url,
+            "createdAt": t.created_at.isoformat() if t.created_at else "",
+            "updatedAt": t.updated_at.isoformat() if t.updated_at else "",
+        } for t in tasks]
+    finally:
+        db.close()
+
+
+@router.post("/video-analysis/fetch")
+async def va_fetch_comments(body: dict):
+    """Trigger video comment fetch for a Bilibili URL."""
+    global _va_state
+
+    url = body.get("url", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="请提供B站视频链接")
+
+    bvid, err = _parse_bilibili_url(url)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    # Check if already running
+    if _va_state.get("status") in ("fetching", "analyzing"):
+        return {"ok": False, "message": "已有任务正在运行，请等待完成"}
+
+    # Get video info first
+    aid, title, cover, info_err = _bili_get_aid(bvid)
+    if info_err:
+        return {"ok": False, "message": f"获取视频信息失败: {info_err}"}
+
+    # Create task record
+    task_id = str(_uuid.uuid4())[:12]
+    db = SessionLocal()
+    try:
+        task = VideoAnalysisTask(
+            id=task_id, bvid=bvid, aid=aid, title=title, cover_url=cover,
+            status="fetching",
+        )
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+    # Start background thread
+    _va_state = {"task_id": task_id, "status": "fetching", "progress": "正在拉取热度排序评论..."}
+    threading.Thread(target=_va_run_fetch, args=(task_id, bvid, aid), daemon=True).start()
+
+    return {
+        "ok": True, "taskId": task_id, "bvid": bvid, "title": title,
+        "message": f"开始拉取《{title}》的评论...",
+    }
+
+
+def _va_run_fetch(task_id: str, bvid: str, aid: int):
+    """Background: fetch comments (hot + time, each up to 500 + sub-replies)."""
+    global _va_state
+    db = SessionLocal()
+    try:
+        _va_state["progress"] = "正在拉取热度排序评论..."
+        hot_comments = _bili_fetch_comments(aid, mode=3, max_count=1000)
+        print(f"[VA-Fetch] Hot sort: {len(hot_comments)} items")
+        _va_state["progress"] = f"已获取{len(hot_comments)}条热度评论，正在拉取时间排序..."
+
+        time_comments = _bili_fetch_comments(aid, mode=2, max_count=1000)
+        print(f"[VA-Fetch] Time sort: {len(time_comments)} items")
+        _va_state["progress"] = f"已获取{len(time_comments)}条时间评论，正在保存..."
+
+        all_comments = hot_comments + time_comments
+
+        # Keyword matching
+        from app.sentiment import _load_keywords
+        kw_dict = _load_keywords()
+        matched_total = 0
+        for c in all_comments:
+            c["matched_keywords"] = _match_keywords_for_comment(c.get("content", ""), kw_dict)
+            if c["matched_keywords"]:
+                matched_total += 1
+
+        # Save to DB (dedup by rpid — same comment may appear in both hot & time)
+        saved = 0
+        seen_rpids = set()
+        for c in all_comments:
+            if c["rpid"] in seen_rpids:
+                continue
+            seen_rpids.add(c["rpid"])
+            cid = f"{task_id}_{c['rpid']}"
+            vc = VideoComment(
+                id=cid, task_id=task_id,
+                rpid=c["rpid"], parent_rpid=c["parent_rpid"], root_rpid=c["root_rpid"],
+                uid=c["uid"], user=c["user"][:50], content=c["content"],
+                like_count=c["like_count"], reply_count=c["reply_count"],
+                ctime=c["ctime"], sort_mode=c["sort_mode"],
+                matched_keywords=c["matched_keywords"],
+            )
+            db.add(vc)
+            saved += 1
+
+        # Update task
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if task:
+            task.status = "fetched"
+            task.total_comments = saved
+            task.matched_count = matched_total
+            task.updated_at = datetime.utcnow()
+        db.commit()
+
+        _va_state = {"task_id": task_id, "status": "fetched", "progress": f"完成! 共{saved}条评论, {matched_total}条匹配关键词"}
+        print(f"[VA-Fetch] Done: {saved} comments, {matched_total} matched keywords")
+
+    except Exception as e:
+        print(f"[VA-Fetch] ERROR: {e}")
+        import traceback as _tb; _tb.print_exc()
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if task:
+            task.status = "error"
+            task.error_msg = str(e)[:300]
+            task.updated_at = datetime.utcnow()
+            db.commit()
+        _va_state = {"task_id": task_id, "status": "error", "progress": f"错误: {str(e)[:100]}"}
+    finally:
+        db.close()
+
+
+@router.get("/video-analysis/status")
+async def va_status():
+    """Get current video analysis status."""
+    return _va_state
+
+
+@router.post("/video-analysis/analyze")
+async def va_analyze(body: dict = None):
+    """Trigger DeepSeek coordinate analysis for fetched comments."""
+    global _va_state
+    task_id = (body or {}).get("taskId") or _va_state.get("task_id")
+
+    if not task_id:
+        raise HTTPException(status_code=400, detail="没有可分析的任务")
+
+    api_key = _get_deepseek_key()
+    if not api_key:
+        return {"ok": False, "message": "请先在账号管理页面配置 DeepSeek API Key"}
+
+    # Check task exists and has comments
+    db = SessionLocal()
+    try:
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if not task:
+            return {"ok": False, "message": "任务不存在"}
+        if task.status not in ("fetched", "done"):
+            return {"ok": False, "message": f"当前任务状态为 '{task.status}'，需要先完成评论拉取"}
+        if task.status == "done":
+            return {"ok": False, "message": "该任务已经分析完成"}
+
+        matched_comments = db.query(VideoComment).filter(
+            VideoComment.task_id == task_id,
+            VideoComment.coord_x == -1,
+        ).filter(VideoComment.matched_keywords != []).all()
+
+        if not matched_comments:
+            # No unmatched matched-comments → mark as done directly
+            task.status = "done"
+            task.analyzed_count = db.query(VideoComment).filter(
+                VideoComment.task_id == task_id, VideoComment.coord_x >= 0
+            ).count()
+            db.commit()
+            _calc_centroid(task_id, db)
+            return {"ok": True, "message": "没有新的待分析评论（可能已全部分析或无匹配）"}
+    finally:
+        db.close()
+
+    task.status = "analyzing"
+    db.commit()
+    _va_state = {"task_id": task_id, "status": "analyzing", "progress": f"正在调用 DeepSeek 分析 {len(matched_comments)} 条匹配评论..."}
+
+    threading.Thread(target=_va_run_analyze, args=(task_id, len(matched_comments)), daemon=True).start()
+
+    return {
+        "ok": True, "taskId": task_id,
+        "message": f"正在使用 DeepSeek 分析 {len(matched_comments)} 条匹配评论...",
+        "pendingCount": len(matched_comments),
+    }
+
+
+def _va_run_analyze(task_id: str, pending_count: int):
+    """Background: run DeepSeek coordinate analysis with concurrency=100."""
+    global _va_state
+    import time as _time
+    api_key = _get_deepseek_key()
+    db = SessionLocal()
+
+    try:
+        comments = db.query(VideoComment).filter(
+            VideoComment.task_id == task_id,
+            VideoComment.coord_x == -1,
+        ).filter(VideoComment.matched_keywords != None).all()
+
+        analyzed = 0
+        failed = 0
+
+        def analyze_one(vc):
+            x, y = _deepseek_score_comment(vc.content, api_key)
+            return vc.id, x, y
+
+        executor = ThreadPoolExecutor(max_workers=100)
+        futures = {executor.submit(analyze_one, vc): vc for vc in comments}
+
+        # Collect ALL results first — no DB writes inside the thread loop to avoid session sharing issues
+        results: list[tuple[str, int, int]] = []  # [(cid, x, y), ...]
+        done_count = 0
+        total = len(comments)
+        for future in as_completed(futures):
+            try:
+                cid, x, y = future.result(timeout=30)
+                results.append((cid, x, y))
+                if x >= 0:
+                    analyzed += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                print(f"[VA-Analyze] Future error: {e}")
+
+            done_count += 1
+            if done_count % 20 == 0 or done_count == total:
+                _va_state["progress"] = f"分析进度: {done_count}/{total} (成功{analyzed}, 失败{failed})"
+
+        executor.shutdown(wait=False)
+
+        # Bulk write all results in a single transaction (fresh session to avoid stale state)
+        write_db = SessionLocal()
+        try:
+            for cid, x, y in results:
+                vc = write_db.query(VideoComment).filter(VideoComment.id == cid).first()
+                if vc:
+                    vc.coord_x = x
+                    vc.coord_y = y
+            write_db.commit()
+        except Exception as e:
+            print(f"[VA-Analyze] Batch write error: {e}")
+            write_db.rollback()
+            raise
+        finally:
+            write_db.close()
+
+        # Update task status
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if task:
+            task.status = "done"
+            task.analyzed_count = db.query(VideoComment).filter(
+                VideoComment.task_id == task_id, VideoComment.coord_x >= 0
+            ).count()
+            task.updated_at = datetime.utcnow()
+            db.commit()
+
+            # Calculate centroid
+            _calc_centroid(task_id, db)
+
+        _va_state = {
+            "task_id": task_id, "status": "done",
+            "progress": f"分析完成! 成功{analyzed}, 失败{failed}",
+        }
+        print(f"[VA-Analyze] Done: analyzed={analyzed}, failed={failed}")
+
+    except Exception as e:
+        print(f"[VA-Analyze] ERROR: {e}")
+        import traceback as _tb; _tb.print_exc()
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if task:
+            task.status = "error"
+            task.error_msg = str(e)[:300]
+            db.commit()
+        _va_state = {"task_id": task_id, "status": "error", "progress": f"错误: {str(e)[:100]}"}
+    finally:
+        db.close()
+
+
+def _calc_centroid(task_id: str, db):
+    """Calculate weighted centroid (a,b) where weight Z = count of identical (x,y) coordinates.
+    Computes TWO centroids:
+      1. all-points centroid (including neutral center)
+      2. no-neutral centroid (excluding x=50,y=50 to avoid skew from neutral/unopinionated comments)
+    Formula: a = Σ(x_i * z_i) / Σ(z_i), b = Σ(y_i * z_i) / Σ(z_i)"""
+    comments = db.query(VideoComment).filter(
+        VideoComment.task_id == task_id,
+        VideoComment.coord_x >= 0,
+        VideoComment.coord_y >= 0,
+    ).all()
+
+    if not comments:
+        return
+
+    # Separate into all-points and no-neutral sets
+    coord_counts_all: dict[tuple[int, int], int] = {}
+    coord_counts_no_neutral: dict[tuple[int, int], int] = {}
+    for c in comments:
+        key = (c.coord_x, c.coord_y)
+        coord_counts_all[key] = coord_counts_all.get(key, 0) + 1
+        if key != (50, 50):
+            coord_counts_no_neutral[key] = coord_counts_no_neutral.get(key, 0) + 1
+
+    if not coord_counts_all:
+        return
+
+    def _compute_centroid(cc: dict[tuple[int, int], int]) -> tuple[float, float]:
+        total_weight = sum(cc.values())
+        weighted_sum_x = sum(x * z for (x, _y), z in cc.items())
+        weighted_sum_y = sum(y * z for (_x, y), z in cc.items())
+        cx = weighted_sum_x / total_weight if total_weight > 0 else 50.0
+        cy = weighted_sum_y / total_weight if total_weight > 0 else 50.0
+        return round(cx, 2), round(cy, 2)
+
+    centroid_x, centroid_y = _compute_centroid(coord_counts_all)
+
+    # No-neutral centroid — fall back to all-point centroid if all points are at center
+    if coord_counts_no_neutral:
+        centroid_x_no, centroid_y_no = _compute_centroid(coord_counts_no_neutral)
+    else:
+        centroid_x_no, centroid_y_no = centroid_x, centroid_y
+
+    task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+    if task:
+        task.centroid_x = centroid_x
+        task.centroid_y = centroid_y
+        task.centroid_x_no_origin = centroid_x_no
+        task.centroid_y_no_origin = centroid_y_no
+        db.commit()
+    print(f"[VA-Centroid] ALL=({centroid_x:.2f},{centroid_y:.2f}) NO_NEUTRAL=({centroid_x_no:.2f},{centroid_y_no:.2f}) "
+          f"from {len(comments)} pts, neutral_center_count={coord_counts_all.get((50, 50), 0)}, "
+          f"unique={len(coord_counts_all)}, no_neutral_unique={len(coord_counts_no_neutral)}")
+
+
+@router.get("/video-analysis/result/{task_id}")
+async def va_result(task_id: str):
+    """Get heatmap grid data and centroid for a completed task."""
+    db = SessionLocal()
+    try:
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+
+        comments = db.query(VideoComment).filter(
+            VideoComment.task_id == task_id,
+            VideoComment.coord_x >= 0,
+            VideoComment.coord_y >= 0,
+        ).all()
+
+        # Build heatmap grid: key=(x,y) → z(count)
+        heatmap_grid: dict[str, list] = {}  # {"x,y": [count, sample_contents]}
+        for c in comments:
+            key = f"{c.coord_x},{c.coord_y}"
+            if key not in heatmap_grid:
+                heatmap_grid[key] = [0, []]
+            heatmap_grid[key][0] += 1
+            if len(heatmap_grid[key][1]) < 3:  # keep up to 3 sample contents per cell
+                heatmap_grid[key][1].append(c.content[:80])
+
+        # Convert to array format for frontend
+        points = []
+        for k, v in heatmap_grid.items():
+            xy = k.split(",")
+            points.append({
+                "x": int(xy[0]), "y": int(xy[1]),
+                "z": v[0],  # height = frequency
+                "samples": v[1],
+            })
+
+        return {
+            "task": {
+                "id": task.id, "bvid": task.bvid, "title": task.title,
+                "status": task.status,
+                "totalComments": task.total_comments,
+                "matchedCount": task.matched_count,
+                "analyzedCount": task.analyzed_count,
+                "centroidX": task.centroid_x,
+                "centroidY": task.centroid_y,
+                "centroidXNoNeutral": task.centroid_x_no_origin,
+                "centroidYNoNeutral": task.centroid_y_no_origin,
+                "coverUrl": task.cover_url,
+            },
+            "points": points,
+            "totalPoints": len(points),
+            "totalAnalyzedComments": len(comments),
+            "neutralCenterCount": heatmap_grid.get("50,50", [0])[0],
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/video-analysis/task/{task_id}")
+async def va_delete_task(task_id: str):
+    """Delete a video analysis task and all its comments."""
+    global _va_state
+    db = SessionLocal()
+    try:
+        task = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+
+        # Delete all comments for this task
+        db.query(VideoComment).filter(VideoComment.task_id == task_id).delete()
+        db.delete(task)
+        db.commit()
+
+        if _va_state.get("task_id") == task_id:
+            _va_state = {"task_id": None, "status": "idle", "progress": ""}
+
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
 # Helpers
 def _t(t): return {"id":t.id,"platform":t.platform,"title":t.title,"rank":t.rank,"heat":t.heat,"url":t.url or "","fetchedAt":t.fetched_at.isoformat() if t.fetched_at else "","sentiment":t.sentiment,"relatedGame":t.related_game,"isGameRelated":t.is_game_related}
-def _p(p): return {"id":p.id,"topicId":p.topic_id,"platform":p.platform,"content":p.content,"author":p.author or "","likes":p.likes or 0,"comments":p.comments or 0,"timestamp":p.timestamp.isoformat() if p.timestamp else "","sentiment":p.sentiment,"url":p.url or ""}
+def _p(p): return {"id":p.id,"topicId":p.topic_id,"platform":p.platform,"content":p.content,"author":p.author or "","likes":p.likes or 0,"comments":p.comments or 0,"timestamp":p.timestamp.isoformat() if t.timestamp else "","sentiment":p.sentiment,"url":p.url or ""}
 def _s(s): return {"date":s.date,"totalTopics":s.total_topics,"gameRelated":s.game_related,"positive":s.positive,"negative":s.negative,"neutral":s.neutral,"irrelevant":s.irrelevant,"byPlatform":s.by_platform or {}}
 def _k(k): return {"id":k.id,"keyword":k.keyword,"category":k.category,"addedAt":k.added_at.isoformat() if k.added_at else "","addedBy":k.added_by}
 def _a(a): return {"platform":a.platform,"username":a.username or "","cookie":a.cookie or "","isValid":a.is_valid,"lastVerified":a.last_verified.isoformat() if a.last_verified else ""}
+
+
+# ==================== Saved Video Analysis Tasks (已存储任务) ====================
+
+@router.post("/video-analysis/saved")
+async def save_va_task(body: dict):
+    """Archive a completed video analysis task."""
+    task_id = body.get("taskId")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="缺少taskId")
+    db = SessionLocal()
+    try:
+        source = db.query(VideoAnalysisTask).filter(VideoAnalysisTask.id == task_id).first()
+        if not source:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if source.status != "done":
+            raise HTTPException(status_code=400, detail="只能存储已完成的分析")
+        # Check already saved
+        existing = db.query(SavedVaTask).filter(SavedVaTask.source_task_id == task_id).first()
+        if existing:
+            return {"ok": True, "id": existing.id, "message": "已存在归档"}
+        saved = SavedVaTask(
+            source_task_id=task_id,
+            bvid=source.bvid,
+            title=source.title,
+            cover_url=source.cover_url,
+            total_comments=source.total_comments,
+            matched_count=source.matched_count,
+            analyzed_count=source.analyzed_count,
+            centroid_x=source.centroid_x,
+            centroid_y=source.centroid_y,
+            centroid_x_no_origin=source.centroid_x_no_origin,
+            centroid_y_no_origin=source.centroid_y_no_origin,
+        )
+        db.add(saved)
+        db.commit()
+        print(f"[SavedVA] Archived task {task_id} -> saved_id={saved.id}")
+        return {"ok": True, "id": saved.id, "message": "已存储"}
+    finally:
+        db.close()
+
+
+@router.get("/video-analysis/saved")
+async def list_saved_va_tasks():
+    """List all archived video analysis tasks."""
+    db = SessionLocal()
+    try:
+        items = db.query(SavedVaTask).order_by(SavedVaTask.saved_at.desc()).all()
+        return {
+            "items": [{
+                "id": s.id, "sourceTaskId": s.source_task_id, "bvid": s.bvid,
+                "title": s.title, "coverUrl": s.cover_url,
+                "totalComments": s.total_comments, "matchedCount": s.matched_count,
+                "analyzedCount": s.analyzed_count,
+                "centroidX": s.centroid_x, "centroidY": s.centroid_y,
+                "centroidXNoOrigin": s.centroid_x_no_origin, "centroidYNoOrigin": s.centroid_y_no_origin,
+                "savedAt": s.saved_at.isoformat(),
+            } for s in items],
+            "total": len(items),
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/video-analysis/saved/{saved_id}")
+async def delete_saved_va_task(saved_id: int):
+    """Delete an archived task and its associated word cloud / deep analysis."""
+    db = SessionLocal()
+    try:
+        saved = db.query(SavedVaTask).filter(SavedVaTask.id == saved_id).first()
+        if not saved:
+            raise HTTPException(status_code=404, detail="不存在")
+        # Cascade delete word clouds and deep analyses
+        db.query(WordCloudItem).filter(WordCloudItem.saved_va_task_id == saved_id).delete()
+        db.query(DeepAnalysis).filter(DeepAnalysis.saved_va_task_id == saved_id).delete()
+        db.delete(saved)
+        db.commit()
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+# ==================== Word Cloud (词云) ====================
+
+@router.post("/word-cloud/generate")
+async def generate_word_cloud(body: dict):
+    """Generate word cloud from all comments of a saved task. Uses jieba for segmentation."""
+    import jieba
+    import jieba.analyse
+    saved_id = body.get("savedTaskId")
+    if not saved_id:
+        raise HTTPException(status_code=400, detail="缺少savedTaskId")
+    db = SessionLocal()
+    try:
+        saved = db.query(SavedVaTask).filter(SavedVaTask.id == saved_id).first()
+        if not saved:
+            raise HTTPException(status_code=404, detail="已存储任务不存在")
+        
+        # Get all comments content for this task
+        comments = db.query(VideoComment.content).filter(
+            VideoComment.task_id == saved.source_task_id,
+            VideoComment.content != "",
+        ).all()
+        
+        if not comments:
+            raise HTTPException(status_code=400, detail="该任务无评论数据")
+        
+        # Concatenate all comment text
+        full_text = "\n".join([c[0] for c in comments])
+        
+        # Use jieba to extract keywords with TF-IDF
+        # Add custom stop words
+        stop_words = set("的 了 在 是 我 你 他 她 它 们 这 那 有 就 和 与 或 但 而 因为 所以 如果 虽然 但是 可以 这个 那个 什么 怎么 为什么 哪 一个 一些 也 都 很 太 更 最 啊 吧 呢 吗 哦 哈 嗯 嗯嗯".split())
+        
+        words = jieba.analyse.extract_tags(full_text, topK=150, withWeight=True)
+        # Filter out single-char and stop words
+        filtered = [(w, round(float(weight) * 1000)) for w, weight in words if len(w) >= 2 and w not in stop_words]
+        
+        if not filtered:
+            raise HTTPException(status_code=500, detail="分词结果为空")
+        
+        # Take top 100
+        filtered = filtered[:100]
+        
+        # Delete existing word cloud for this saved task
+        db.query(WordCloudItem).filter(WordCloudItem.saved_va_task_id == saved_id).delete()
+        
+        wc = WordCloudItem(
+            saved_va_task_id=saved_id,
+            words_json=[{"text": w, "count": c, "weight": min(max(c, 10), 80)} for w, c in filtered],
+            total_words=len(filtered),
+        )
+        db.add(wc)
+        db.commit()
+        
+        print(f"[WordCloud] Generated for saved_task={saved_id}, {len(filtered)} words")
+        return {"ok": True, "id": wc.id, "wordCount": len(filtered), "words": wc.words_json}
+    finally:
+        db.close()
+
+
+@router.get("/word-cloud/list")
+async def list_word_clouds():
+    """List all generated word clouds."""
+    db = SessionLocal()
+    try:
+        items = db.query(WordCloudItem).order_by(WordCloudItem.generated_at.desc()).all()
+        result = []
+        for wc in items:
+            saved = db.query(SavedVaTask).filter(SavedVaTask.id == wc.saved_va_task_id).first()
+            result.append({
+                "id": wc.id, "savedVaTaskId": wc.saved_va_task_id,
+                "taskTitle": saved.title if saved else "(已删除)",
+                "taskBvid": saved.bvid if saved else "",
+                "totalWords": wc.total_words,
+                "words": wc.words_json,
+                "generatedAt": wc.generated_at.isoformat(),
+            })
+        return {"items": result, "total": len(result)}
+    finally:
+        db.close()
+
+
+@router.delete("/word-cloud/{wc_id}")
+async def delete_word_cloud(wc_id: int):
+    """Delete a word cloud record."""
+    db = SessionLocal()
+    try:
+        wc = db.query(WordCloudItem).filter(WordCloudItem.id == wc_id).first()
+        if not wc:
+            raise HTTPException(status_code=404, detail="不存在")
+        db.delete(wc)
+        db.commit()
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+# ==================== Deep Analysis (深度分析) ====================
+
+_deep_analysis_state: dict = {"status": "idle", "progress": "", "analysis_id": None}
+
+@router.post("/deep-analysis/start")
+async def start_deep_analysis(body: dict):
+    """Start DeepSeek deep analysis on key comments of a saved task."""
+    saved_id = body.get("savedTaskId")
+    if not saved_id:
+        raise HTTPException(status_code=400, detail="缺少savedTaskId")
+    
+    global _deep_analysis_state
+    if _deep_analysis_state.get("status") in ("running",):
+        raise HTTPException(status_code=409, detail="已有分析任务在运行中")
+    
+    db = SessionLocal()
+    try:
+        saved = db.query(SavedVaTask).filter(SavedVaTask.id == saved_id).first()
+        if not saved:
+            raise HTTPException(status_code=404, detail="已存储任务不存在")
+        
+        # Get top 100 hot comments + their sub-replies
+        comments = db.query(VideoComment).filter(
+            VideoComment.task_id == saved.source_task_id,
+            VideoComment.sort_mode == "hot",
+        ).order_by(VideoComment.like_count.desc()).limit(100).all()
+        
+        if not comments:
+            raise HTTPException(status_code=400, detail="该任务无分析完成的评论")
+        
+        # Build comment text for LLM (include sub-reply context)
+        comment_texts = []
+        for c in comments[:50]:  # Send up to 50 main comments to save tokens
+            text = f"[用户:{c.user} 点赞:{c.like_count}] {c.content}"
+            # Get some sub replies
+            subs = db.query(VideoComment).filter(
+                VideoComment.task_id == saved.source_task_id,
+                VideoComment.root_rpid == c.rpid,
+            ).limit(3).all()
+            if subs:
+                text += "\n楼中楼:"
+                for s in subs:
+                    text += f"\n  @{s.user}: {s.content}"
+            comment_texts.append(text)
+        
+        # Create analysis record
+        da = DeepAnalysis(
+            saved_va_task_id=saved_id,
+            status="running",
+        )
+        db.add(da)
+        db.commit()
+        
+        _deep_analysis_state = {"status": "running", "progress": "正在调用DeepSeek进行深度分析...", "analysis_id": da.id}
+        
+        # Background thread for DeepSeek call
+        threading.Thread(target=_run_deep_analysis, args=(da.id, comment_texts, saved.title), daemon=True).start()
+        
+        return {"ok": True, "analysisId": da.id, "message": "深度分析已启动"}
+    finally:
+        db.close()
+
+
+def _run_deep_analysis(analysis_id: int, comment_texts: list[str], title: str):
+    """Background: call DeepSeek for deep opinion analysis."""
+    global _deep_analysis_state
+    ds_key = _get_deepseek_key()
+    db = SessionLocal()
+    try:
+        _deep_analysis_state["progress"] = f"正在整理{len(comment_texts)}条关键评论..."
+        
+        if not ds_key:
+            da = db.query(DeepAnalysis).filter(DeepAnalysis.id == analysis_id).first()
+            da.status = "error"
+            da.error_msg = "未配置DeepSeek API Key"
+            da.completed_at = datetime.utcnow()
+            db.commit()
+            _deep_analysis_state = {"status": "idle", "progress": "", "analysis_id": None}
+            return
+        
+        import httpx
+        
+        # Build prompt
+        system_prompt = """你是一个专业的舆论场分析师。请对以下B站视频的评论区内容进行深度分析，输出JSON格式：
+{
+  "overall_trend": "舆论总体趋势总结（200字以内）",
+  "kol_viewpoints": "高赞用户的主要观点分类和代表言论（300字以内）",
+  "opposition_analysis": "与主流意见对立的观点及其理由（200字以内）"
+}
+请用中文回答，客观中立，不要带个人立场。"""
+        
+        user_content = f"视频标题：{title}\n\n关键评论（按点赞排序）：\n" + "\n---\n".join(comment_texts[:40])
+        
+        _deep_analysis_state["progress"] = "正在等待DeepSeek响应..."
+        
+        resp = httpx.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 2000,
+            },
+            timeout=120,
+        )
+        
+        data = resp.json()
+        raw_text = data["choices"][0]["message"]["content"]
+        
+        # Parse JSON from response
+        import re
+        json_match = re.search(r'\{[^{}]*"overall_trend"[^{}]*\}', raw_text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group())
+        else:
+            parsed = {
+                "overall_trend": raw_text,
+                "kol_viewpoints": "",
+                "opposition_analysis": "",
+            }
+        
+        da = db.query(DeepAnalysis).filter(DeepAnalysis.id == analysis_id).first()
+        da.status = "done"
+        da.overall_trend = parsed.get("overall_trend", "")
+        da.kol_viewpoints = parsed.get("kol_viewpoints", "")
+        da.opposition_analysis = parsed.get("opposition_analysis", "")
+        da.raw_response = raw_text
+        da.completed_at = datetime.utcnow()
+        db.commit()
+        
+        _deep_analysis_state = {"status": "idle", "progress": "done", "analysis_id": None}
+        print(f"[DeepAnalysis] Completed analysis_id={analysis_id}")
+        
+    except Exception as e:
+        print(f"[DeepAnalysis] ERROR: {e}")
+        import traceback; traceback.print_exc()
+        da = db.query(DeepAnalysis).filter(DeepAnalysis.id == analysis_id).first()
+        if da:
+            da.status = "error"
+            da.error_msg = str(e)[:500]
+            da.completed_at = datetime.utcnow()
+            db.commit()
+        _deep_analysis_state = {"status": "idle", "progress": "", "analysis_id": None}
+    finally:
+        db.close()
+
+
+@router.get("/deep-analysis/status")
+async def get_deep_analysis_status():
+    """Get current deep analysis status."""
+    return _deep_analysis_state
+
+
+@router.get("/deep-analysis/list")
+async def list_deep_analyses():
+    """List all deep analysis results."""
+    db = SessionLocal()
+    try:
+        items = db.query(DeepAnalysis).order_by(DeepAnalysis.created_at.desc()).all()
+        result = []
+        for da in items:
+            saved = db.query(SavedVaTask).filter(SavedVaTask.id == da.saved_va_task_id).first()
+            result.append({
+                "id": da.id, "savedVaTaskId": da.saved_va_task_id,
+                "taskTitle": saved.title if saved else "(已删除)",
+                "status": da.status,
+                "overallTrend": da.overall_trend,
+                "kolViewpoints": da.kol_viewpoints,
+                "oppositionAnalysis": da.opposition_analysis,
+                "errorMsg": da.error_msg,
+                "createdAt": da.created_at.isoformat(),
+                "completedAt": da.completed_at.isoformat() if da.completed_at else None,
+            })
+        return {"items": result, "total": len(result)}
+    finally:
+        db.close()
+
+
+@router.get("/deep-analysis/result/{analysis_id}")
+async def get_deep_analysis_result(analysis_id: int):
+    """Get a specific deep analysis result."""
+    db = SessionLocal()
+    try:
+        da = db.query(DeepAnalysis).filter(DeepAnalysis.id == analysis_id).first()
+        if not da:
+            raise HTTPException(status_code=404, detail="不存在")
+        return {
+            "id": da.id, "savedVaTaskId": da.saved_va_task_id,
+            "status": da.status,
+            "overallTrend": da.overall_trend,
+            "kolViewpoints": da.kol_viewpoints,
+            "oppositionAnalysis": da.opposition_analysis,
+            "errorMsg": da.error_msg,
+            "rawResponse": da.raw_response,
+            "createdAt": da.created_at.isoformat(),
+            "completedAt": da.completed_at.isoformat() if da.completed_at else None,
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/deep-analysis/{analysis_id}")
+async def delete_deep_analysis(analysis_id: int):
+    """Delete a deep analysis record."""
+    db = SessionLocal()
+    try:
+        da = db.query(DeepAnalysis).filter(DeepAnalysis.id == analysis_id).first()
+        if not da:
+            raise HTTPException(status_code=404, detail="不存在")
+        db.delete(da)
+        db.commit()
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+# ==================== KOL Top Users (高赞KOL) ====================
+
+@router.get("/video-analysis/kol-top")
+async def get_kol_top_users(task_id: str, sort: str = "hot"):
+    """Get top 10 users by likes (hot) or by most recent (time) for KOL identity check."""
+    db = SessionLocal()
+    try:
+        query = db.query(
+            VideoComment.uid,
+            VideoComment.user,
+            _sql_func.sum(VideoComment.like_count).label("like_sum"),
+            _sql_func.count().label("comment_count"),
+        ).filter(
+            VideoComment.task_id == task_id,
+            VideoComment.uid > 0,
+            VideoComment.parent_rpid == 0,  # only main comments
+        ).group_by(VideoComment.uid, VideoComment.user)
+        
+        if sort == "hot":
+            query = query.order_by(_sql_func.sum(VideoComment.like_count).desc())
+        else:
+            query = query.order_by(VideoComment.ctime.desc())
+        
+        users = query.limit(10).all()
+        
+        # Get face URLs via batch info lookup (optional, use placeholder if unavailable)
+        result = []
+        for row in users:
+            uid = row[0]
+            user = row[1]
+            like_sum = row[2]
+            cnt = row[3]
+            result.append({
+                "uid": uid,
+                "name": user or f"UID_{uid}",
+                "face": f"https://i2.hdslb.com/bfs/face/{uid}_medium.jpg",
+                "likeSum": like_sum or 0,
+                "commentCount": cnt,
+            })
+        
+        return {"users": result, "sort": sort, "taskId": task_id}
+    except Exception as e:
+        print(f"[KOL-TOP] ERROR: {e}")
+        import traceback; traceback.print_exc()
+        return {"users": [], "sort": sort, "taskId": task_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+# ==================== Identity Queue (查成分队列) ====================
+
+_identity_queue_lock = threading.Lock()
+
+@router.get("/identity-queue")
+async def list_identity_queue():
+    """List all queued identity-check tasks, ordered by sort_order."""
+    db = SessionLocal()
+    try:
+        items = db.query(IdentityQueue).order_by(IdentityQueue.sort_order.asc(), IdentityQueue.added_at.asc()).all()
+        return {
+            "items": [{
+                "id": q.id, "uid": q.uid, "name": q.name, "face": q.face,
+                "source": q.source, "sortOrder": q.sort_order,
+                "status": q.status, "addedAt": q.added_at.isoformat(),
+            } for q in items],
+            "total": len(items),
+        }
+    finally:
+        db.close()
+
+
+@router.post("/identity-queue")
+async def add_to_identity_queue(body: dict):
+    """Add a UID to the identity-check queue."""
+    uid = body.get("uid")
+    name = body.get("name", "")
+    face = body.get("face", "")
+    source = body.get("source", "manual")
+    if not uid:
+        raise HTTPException(status_code=400, detail="缺少uid")
+    db = SessionLocal()
+    try:
+        # Check duplicate
+        existing = db.query(IdentityQueue).filter(
+            IdentityQueue.uid == uid,
+            IdentityQueue.status == "pending",
+        ).first()
+        if existing:
+            return {"ok": True, "id": existing.id, "message": "已在队列中"}
+        
+        # Get max sort order
+        max_order = db.query(_sql_func.max(IdentityQueue.sort_order)).scalar() or 0
+        
+        q = IdentityQueue(uid=int(uid), name=name, face=face, source=source, sort_order=max_order + 1)
+        db.add(q)
+        db.commit()
+        return {"ok": True, "id": q.id, "message": "已加入队列"}
+    finally:
+        db.close()
+
+
+@router.delete("/identity-queue/{q_id}")
+async def remove_from_identity_queue(q_id: int):
+    """Remove a task from the identity queue."""
+    db = SessionLocal()
+    try:
+        q = db.query(IdentityQueue).filter(IdentityQueue.id == q_id).first()
+        if not q:
+            raise HTTPException(status_code=404, detail="不存在")
+        db.delete(q)
+        # Re-index remaining
+        remaining = db.query(IdentityQueue).order_by(IdentityQueue.sort_order.asc()).all()
+        for i, item in enumerate(remaining):
+            item.sort_order = i + 1
+        db.commit()
+        return {"ok": True, "message": "已移除"}
+    finally:
+        db.close()
+
+
+@router.put("/identity-queue/reorder")
+async def reorder_identity_queue(body: dict):
+    """Reorder queue items. Body: {"orderedIds": [1, 3, 2, ...]}"""
+    ordered_ids = body.get("orderedIds", [])
+    if not ordered_ids:
+        raise HTTPException(status_code=400, detail="缺少orderedIds")
+    db = SessionLocal()
+    try:
+        for idx, q_id in enumerate(ordered_ids):
+            q = db.query(IdentityQueue).filter(IdentityQueue.id == q_id).first()
+            if q:
+                q.sort_order = idx + 1
+        db.commit()
+        return {"ok": True, "message": "顺序已更新"}
+    finally:
+        db.close()

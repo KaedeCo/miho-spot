@@ -4,12 +4,13 @@ import {
 } from "tdesign-react";
 import {
   SearchIcon, UserIcon, TimeIcon, ThumbUpIcon, ChatIcon, LinkIcon, RefreshIcon,
-  PlayCircleIcon, FileIcon,
+  PlayCircleIcon, FileIcon, DeleteIcon, ChevronDownIcon, ChevronUpIcon, ViewListIcon,
 } from "tdesign-icons-react";
 import {
   getBiliUserInfo, getBiliAnalyzeStatus, getBiliAnalyzeResult, triggerBiliAnalyze, saveBiliProfile,
+  getIdentityQueue, addToIdentityQueue, removeFromIdentityQueue, reorderIdentityQueue,
 } from "../services/api";
-import type { BiliUserInfo, BiliAnalyzeResult, BiliContentItem } from "../types";
+import type { BiliUserInfo, BiliAnalyzeResult, BiliContentItem, IdentityQueueItem } from "../types";
 
 const CATEGORY_META: Record<string, { color: string; label: string }> = {
   mihoyo_game: { color: "#6366f1", label: "米哈游游戏" },
@@ -74,6 +75,12 @@ export default function CheckIdentity() {
   const [error, setError] = useState("");
   const [tabValue, setTabValue] = useState("comments");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Identity queue
+  const [queueItems, setQueueItems] = useState<IdentityQueueItem[]>([]);
+  const [showQueue, setShowQueue] = useState(true);
+  const queueRef = useRef<HTMLDivElement | null>(null);
+  const dragItemRef = useRef<number | null>(null);
 
   useEffect(() => { return () => { if (pollRef.current) clearInterval(pollRef.current); }; }, []);
 
@@ -142,6 +149,61 @@ export default function CheckIdentity() {
     } catch (e: any) { setAnalyzing(false); setError(e.message); }
   }, [uid, loadResult]);
 
+  // Queue management
+  const loadQueue = useCallback(async () => {
+    try {
+      const res = await getIdentityQueue();
+      setQueueItems(res.items);
+    } catch {}
+  }, []);
+
+  useEffect(() => { loadQueue(); }, [loadQueue]);
+
+  const handleAddToQueue = async () => {
+    const uidNum = parseInt(uid.trim());
+    if (!uidNum || uidNum <= 0) { MessagePlugin.warning("请输入有效的UID"); return; }
+    try {
+      const res = await addToIdentityQueue(uidNum);
+      MessagePlugin.success(res.message);
+      loadQueue();
+    } catch (e: any) { MessagePlugin.error(e.message); }
+  };
+
+  const handleRemoveFromQueue = async (qId: number) => {
+    try {
+      await removeFromIdentityQueue(qId);
+      setQueueItems(queueItems.filter((q) => q.id !== qId));
+      MessagePlugin.success("已移除");
+    } catch (e: any) { MessagePlugin.error(e.message); }
+  };
+
+  const handleDragStart = (e: React.DragEvent, id: number) => {
+    dragItemRef.current = id;
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  };
+
+  const handleDrop = async (e: React.DragEvent, targetId: number) => {
+    e.preventDefault();
+    if (!dragItemRef.current || dragItemRef.current === targetId) return;
+    const items = [...queueItems];
+    const dragIdx = items.findIndex((q) => q.id === dragItemRef.current);
+    const targetIdx = items.findIndex((q) => q.id === targetId);
+    if (dragIdx < 0 || targetIdx < 0) return;
+    // Reorder
+    const [removed] = items.splice(dragIdx, 1);
+    items.splice(targetIdx, 0, removed);
+    // Update sort order and persist
+    const orderedIds = items.map((q) => q.id);
+    setQueueItems(items);
+    try { await reorderIdentityQueue(orderedIds); } catch {}
+    dragItemRef.current = null;
+  };
+
   const totalComments = result?.total_comments ?? 0;
   const matchedCount = result?.matched_count ?? 0;
   const contentCount = result?.content_count ?? 0;
@@ -163,7 +225,61 @@ export default function CheckIdentity() {
             onKeydown={(e: any) => { if (e.key === "Enter") handleSearch(); }} />
           <Button size="large" theme="primary" icon={<SearchIcon />} onClick={handleSearch}
             loading={loading} disabled={analyzing || !uid.trim()}>开始分析</Button>
+          <Button size="large" variant="outline" icon={<ViewListIcon />}
+            onClick={handleAddToQueue} disabled={!uid.trim()}
+            title="将UID加入查成分队列">加入队列</Button>
         </div>
+      </div>
+
+      {/* Identity Queue Panel */}
+      <div className="glass-card rounded-xl overflow-hidden">
+        <button
+          className="w-full flex items-center justify-between px-5 py-3 hover:bg-white/[0.03] transition-colors"
+          onClick={() => setShowQueue(!showQueue)}
+        >
+          <span className="text-sm font-semibold text-gray-300">
+            <ViewListIcon size="18px" className="mr-1.5 inline-block align-text-bottom" />
+            查成分任务队列 ({queueItems.length})
+          </span>
+          <span className="text-gray-500">{showQueue ? <ChevronUpIcon size="16px" /> : <ChevronDownIcon size="16px" />}</span>
+        </button>
+        {showQueue && (
+          <div className="border-t border-[#2a2a4a] max-h-64 overflow-y-auto" ref={queueRef}>
+            {queueItems.length === 0 ? (
+              <div className="text-center py-6 text-gray-600 text-xs">队列为空，可输入UID后点击"加入队列"</div>
+            ) : queueItems.map((q, idx) => (
+              <div
+                key={q.id}
+                draggable
+                onDragStart={(e) => handleDragStart(e, q.id)}
+                onDragOver={handleDragOver}
+                onDrop={(e) => handleDrop(e, q.id)}
+                className={`flex items-center gap-3 px-4 py-2.5 border-b border-white/[0.03] hover:bg-white/[0.04] transition-colors cursor-grab active:cursor-grabbing ${q.status === "running" ? "bg-purple-500/10" : ""}`}
+              >
+                <span className="w-5 h-5 flex items-center justify-center rounded bg-gray-800 text-gray-400 text-[10px] font-mono shrink-0">
+                  #{idx + 1}
+                </span>
+                {q.face ? <img src={q.face} alt="" className="w-7 h-7 rounded-full shrink-0 object-cover"
+                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} /> : <div className="w-7 h-7 rounded-full shrink-0 bg-gray-700" />}
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs text-gray-200 truncate">{q.name || `UID:${q.uid}`}</div>
+                  <div className="text-[10px] text-gray-500">UID:{q.uid} · {q.source === "video_analysis_kol" ? "视频分析KOL" : "手动添加"} · {q.addedAt.slice(11, 16)}</div>
+                </div>
+                {q.status === "pending" && <Tag size="small" variant="light" theme="default" className="shrink-0">排队中</Tag>}
+                {q.status === "running" && <Tag size="small" variant="light" theme="warning" className="shrink-0"><Loading size="12px" /></Tag>}
+                {q.status === "done" && <Tag size="small" variant="light" theme="success" className="shrink-0">完成</Tag>}
+                {(q.status === "pending") && (
+                  <button
+                    className="p-1 rounded hover:bg-red-500/20 shrink-0"
+                    onClick={() => handleRemoveFromQueue(q.id)}
+                  >
+                    <DeleteIcon size="14px" className="text-gray-500 hover:text-red-400" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {error && <div className="glass-card p-4 rounded-xl border border-red-500/30 bg-red-500/5 text-red-400">{error}</div>}
@@ -217,8 +333,8 @@ export default function CheckIdentity() {
                 {totalComments > 0 ? (
                   <div className="space-y-3 pt-2">
                     {matchedCount > 0 && <div className="text-xs text-gray-400 mb-1">命中 {matchedCount} 条关键词</div>}
-                    {(result.comments || []).map((c) => (
-                      <div key={c.rpid} className={`p-4 rounded-lg border transition-colors ${c.matched_keywords?.length ? "bg-purple-500/[0.04] border-purple-500/20" : "bg-white/[0.03] border-white/[0.06] hover:border-white/[0.12]"}`}>
+                    {(result.comments || []).map((c, ci) => (
+                      <div key={c.rpid ? `rpid-${c.rpid}` : `idx-${ci}`} className={`p-4 rounded-lg border transition-colors ${c.matched_keywords?.length ? "bg-purple-500/[0.04] border-purple-500/20" : "bg-white/[0.03] border-white/[0.06] hover:border-white/[0.12]"}`}>
                         <div className="text-gray-200 text-sm leading-relaxed whitespace-pre-wrap break-words">{c.content}</div>
                         <div className="flex items-center gap-4 mt-2 flex-wrap">
                           <span className="flex items-center gap-1 text-xs text-gray-500"><TimeIcon size="12px" />{c.time_str}</span>

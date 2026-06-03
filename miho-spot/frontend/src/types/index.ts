@@ -67,11 +67,31 @@ export interface KeywordEntry {
 
 // Keyword categories (defaults, can be overridden by backend)
 export const KEYWORD_CATEGORIES = {
+  // === 米哈游系 ===
   mihoyo_game: "米哈游游戏",
   mihoyo_character: "米哈游角色",
   mihoyo_cv: "米哈游CV",
+  // === 竞品 ===
   competitor: "竞品游戏",
+  // === 通用 ===
   general: "二游圈通用",
+  // === 舆论情感词 ===
+  sentiment_neg: "负面情感词",
+  sentiment_pos: "正面情感词",
+  // === 社区/平台 ===
+  platform: "社区/平台术语",
+  // === 游戏机制 ===
+  game_mechanic: "游戏系统/机制",
+  // === 玩家群体 ===
+  player_group: "玩家群体/称呼",
+  // === 热梗 ===
+  meme: "热梗/网络用语",
+  // === 行业商业 ===
+  industry: "行业/商业术语",
+  // === ACG文化 ===
+  acg: "二次元/ACG文化",
+  // === B站用语 ===
+  bili_slang: "B站/视频圈用语",
 } as const;
 
 export interface CategoryEntry {
@@ -217,4 +237,118 @@ export interface BiliAnalyzeResult {
   total_pages?: number;
   spectrum?: BiliSpectrum;
   analyzed_at?: string;
+}
+
+// ========== Video Analysis Types ==========
+
+export interface VaTask {
+  id: string;
+  bvid: string;
+  title: string;
+  status: "idle" | "fetching" | "fetched" | "analyzing" | "done" | "error";
+  totalComments: number;
+  matchedCount: number;
+  analyzedCount: number;
+  centroidX: number;
+  centroidY: number;
+  centroidXNoOrigin: number;  // centroid excluding (50,50) neutral center points
+  centroidYNoOrigin: number;  // centroid excluding (50,50) neutral center points
+  errorMsg: string;
+  coverUrl: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VaHeatmapPoint {
+  x: number;       // 0-100: anti↔pro mihoyo
+  y: number;       // 0-100: rational↔emotional
+  z: number;       // height = frequency count at this coordinate
+  samples: string[]; // up to 3 sample comment contents
+}
+
+export interface VaResult {
+  task: VaTask;
+  points: VaHeatmapPoint[];
+  totalPoints: number;
+  totalAnalyzedComments: number;
+}
+
+export interface VaStatus {
+  task_id: string | null;
+  status: string;
+  progress: string;
+}
+
+// ========== Saved Video Analysis Task Types ==========
+
+export interface SavedVaTask {
+  id: number;
+  sourceTaskId: string;
+  bvid: string;
+  title: string;
+  coverUrl: string;
+  totalComments: number;
+  matchedCount: number;
+  analyzedCount: number;
+  centroidX: number;
+  centroidY: number;
+  centroidXNoOrigin: number;
+  centroidYNoOrigin: number;
+  savedAt: string;
+}
+
+// ========== Word Cloud Types ==========
+
+export interface WordCloudWord {
+  text: string;
+  count: number;
+  weight: number; // for rendering font size
+}
+
+export interface WordCloudItem {
+  id: number;
+  savedVaTaskId: number;
+  taskTitle: string;
+  taskBvid: string;
+  totalWords: number;
+  words: WordCloudWord[];
+  generatedAt: string;
+}
+
+// ========== Deep Analysis Types ==========
+
+export interface DeepAnalysisItem {
+  id: number;
+  savedVaTaskId: number;
+  taskTitle: string;
+  status: "pending" | "running" | "done" | "error";
+  overallTrend: string;
+  kolViewpoints: string;
+  oppositionAnalysis: string;
+  errorMsg: string;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+// ========== KOL User Types ==========
+
+export interface KolUser {
+  uid: number;
+  name: string;
+  face: string;
+  likeSum: number;
+  commentCount: number;
+}
+
+// ========== Identity Queue Types ==========
+
+export interface IdentityQueueItem {
+  id: number;
+  uid: number;
+  name: string;
+  face: string;
+  source: "manual" | "video_analysis_kol";
+  sortOrder: number;
+  status: "pending" | "running" | "done" | "error";
+  addedAt: string;
 }

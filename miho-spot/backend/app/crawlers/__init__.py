@@ -236,21 +236,44 @@ class TiebaCrawler(BaseCrawler):
         return items
 
 
-def fetch_tophub_search(keyword: str = "米哈游", page: int = 1) -> dict:
-    """Call Tophub /search API endpoint (paid) - returns raw response data."""
+def fetch_tophub_search(keyword: str = "米哈游", page: int = 1, max_retries: int = 2) -> dict:
+    """Call Tophub /search API endpoint (paid) - returns raw response data.
+    Includes retry logic with increasing timeout for unreliable network."""
     key = _get_api_key()
     headers = {"Authorization": key}
     url = f"{TOPHUB_BASE}/search"
-    resp = httpx.get(url, headers=headers, params={"q": keyword, "p": page}, timeout=30)
-    print(f"[Tophub Search] HTTP {resp.status_code} q={keyword} p={page}")
-    try:
-        data = resp.json()
-    except Exception:
-        print(f"[Tophub Search] Bad JSON: {resp.text[:200]}")
-        return {"error": True, "msg": "Invalid JSON response"}
-    if data.get("error"):
-        print(f"[Tophub Search] API error: {data.get('msg', 'unknown')}")
-    return data
+
+    for attempt in range(1, max_retries + 1):
+        # Progressive timeout: 30s -> 45s -> 60s
+        t = min(30 * attempt, 60)
+        try:
+            resp = httpx.get(url, headers=headers, params={"q": keyword, "p": page}, timeout=t)
+            print(f"[Tophub Search] HTTP {resp.status_code} q={keyword} p={page} (attempt={attempt}/{max_retries})")
+            try:
+                data = resp.json()
+            except Exception:
+                print(f"[Tophub Search] Bad JSON: {resp.text[:200]}")
+                if attempt < max_retries:
+                    print(f"[Tophub Search] Retrying ({attempt+1}/{max_retries})...")
+                    continue
+                return {"error": True, "msg": "Invalid JSON response"}
+            if data.get("error"):
+                print(f"[Tophub Search] API error: {data.get('msg', 'unknown')}")
+            return data
+        except httpx.TimeoutException as e:
+            print(f"[Tophub Search] Timeout ({t}s): {e}")
+            if attempt < max_retries:
+                import time as _t; _t.sleep(2)
+                continue
+            return {"error": True, "msg": f"Request timed out after {t}s (retried {max_retries} times)"}
+        except Exception as e:
+            print(f"[Tophub Search] Error: {e}")
+            if attempt < max_retries:
+                import time as _t; _t.sleep(2)
+                continue
+            return {"error": True, "msg": str(e)[:200]}
+
+    return {"error": True, "msg": "All retries exhausted"}
 
 
 def _extract_platform_from_url(url: str) -> str:

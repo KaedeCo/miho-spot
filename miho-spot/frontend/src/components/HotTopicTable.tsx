@@ -127,7 +127,7 @@ export default function HotTopicTable({ topics, onTopicClick, className = "" }: 
       <Table
         data={topics}
         columns={columns}
-        rowKey="id"
+        rowKey={(row: any) => `${row.id}-${row.platform}-${row.rank}`}
         size="medium"
         hover
         stripe

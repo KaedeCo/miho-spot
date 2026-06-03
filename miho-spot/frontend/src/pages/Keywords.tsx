@@ -64,7 +64,15 @@ export default function Keywords() {
   const categoryOptions = [{ label: "全部", value: "all" }, ...catList.map(c => ({ label: c.name, value: c.key }))];
   const catEditOptions = catList.map(c => ({ label: c.name, value: c.key }));
 
-  const catColors: Record<string, string> = { mihoyo_game: "#6366f1", mihoyo_character: "#a78bfa", mihoyo_cv: "#f59e0b", competitor: "#ef4444", general: "#6b7280" };
+  const catColors: Record<string, string> = {
+    mihoyo_game: "#6366f1", mihoyo_character: "#a78bfa", mihoyo_cv: "#f59e0b",
+    competitor: "#ef4444", general: "#6b7280",
+    sentiment_neg: "#dc2626", sentiment_pos: "#16a34a",
+    platform: "#2563eb", game_mechanic: "#7c3aed",
+    player_group: "#0891b2", meme: "#ea580c",
+    industry: "#4f46e5", acg: "#db2777",
+    bili_slang: "#ca8a04",
+  };
   const getCatColor = (key: string) => catColors[key] || "#8b5cf6";
 
   // --- Keyword handlers ---

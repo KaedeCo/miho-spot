@@ -39,6 +39,14 @@ async def lifespan(app: FastAPI):
     seed_default_data()
     from app.sentiment import seed_default_keywords
     seed_default_keywords()
+    # Sync JSON files → DB at startup
+    from app.api.routes import sync_daily_stats_from_json, sync_hot_topics_from_json, _load_hot_crawl_from_file, _load_today_search_to_cache
+    print("[Miho-spot] Syncing JSON files to database...")
+    sync_hot_topics_from_json()
+    sync_daily_stats_from_json()
+    # Also preload into memory cache for instant dashboard rendering
+    _load_hot_crawl_from_file()
+    _load_today_search_to_cache()
     print("[Miho-spot] Database initialized and server started.")
     yield
     print("[Miho-spot] Server shutting down.")

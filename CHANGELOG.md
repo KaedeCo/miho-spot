@@ -1,5 +1,49 @@
 # Miho-spot Changelog
 
+## [v1.3.0] — 2026-06-03
+
+### 全栈稳定性修复与数据流完善
+
+#### 前端修复 (6 项)
+
+- **图标导入修复**：`CheckIdentity.tsx` 中 `ListIcon`/`OrderedListIcon` → `ViewListIcon`（TDesign Icons React v0.6.4 中不存在前两者）
+- **React Key 重复警告修复**（4 组件联动）：
+  - `HotTopicTable.tsx`：TDesign Table `rowKey` 从简单字符串改为复合函数
+  - `CheckIdentity.tsx`：Key 增加 `rpid-` 前缀 + index fallback
+  - `HotTopics.tsx`：Key 增加 `topic-` 前缀 + index fallback
+  - 后端 `routes.py` `/topics` 端点：`_hot_cache` + `_search_cache` 拼接时按 ID 去重
+- **TDesign Input 事件修复**：`VideoAnalysis.tsx` 中 `onPressEnter` → `onEnter`
+- **API 参数命名修复**：`api.ts` 中 `taskId` → `task_id`（修复 422 Unprocessable Entity）
+- **缺失导入修复**：`WordCloud.tsx` 添加 `Tag` 组件导入
+- **空 src 渲染修复**：`CheckIdentity.tsx` 中头像 `q.face` 为空时不渲染 `<img>`
+
+#### 后端修复 (4 项)
+
+- **SQLAlchemy 函数名修复**：identity-queue 端点的 `func.max` → `_sql_func.max`
+- **KOL 热度排序 SQL 修复**：`_sql_func.desc("like_sum")` → `_sql_func.sum(VideoComment.like_count).desc()`
+- **视频评论去重**：`_va_run_fetch` 中添加 `seen_rpids` 集合防止重复插入（UNIQUE 约束冲突）
+- **视频分析面板动态定位**：从硬编码 `left-2` 改为根据 `kolPanelOpen` 值动态计算
+
+#### 数据流完善 (3 项)
+
+- **JSON→DB 自动同步**：新增 `sync_hot_topics_from_json()`，启动时扫描 `tophub_search/*.json`，支持 flat array 和 `{parsed_items}` 两种格式，按 ID 去重 Upsert 至 `hot_topics` 表
+- **历史统计 DB 回补机制**：`_build_stats_from_json()` 新增智能回退——当 JSON 中 `parsed_items` 缺少 `sentiment`/`is_game_related` 字段时，自动从 `hot_topics` 表批量查询已分析数据回填
+- **启动同步序列完善**：`main.py` 中 6 步同步管线（init_db → seed → sync_topics → sync_stats → load_hot_cache → load_search_cache）
+
+#### 新增页面
+
+- **VideoAnalysis (`/video-analysis`)**：B站视频舆情挖掘（评论拉取+KOL排名+词云）
+- **WordCloud (`/wordcloud`)**：独立词云生成器
+- **DeepAnalysis (`/deep-analysis`)**：深度分析话题探索页
+
+#### 测试数据
+
+- 修复前 2026-05-31: gameRelated=2, positive=1, negative=0, neutral=1
+- 修复后 2026-05-31: gameRelated=135, positive=53, negative=31, neutral=51
+- 其他日期（06-01/02/03）数据验证一致无变化
+
+---
+
 ## [v1.2.0] — 2026-06-02
 
 ### 🆕 新功能

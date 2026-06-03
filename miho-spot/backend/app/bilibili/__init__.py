@@ -229,7 +229,7 @@ async def fetch_user_video_comments(
             if is_end or page >= (all_count + 99) // 100:
                 break
             page += 1
-            time.sleep(6)  # Safeline WAF: strict IP rate limit, need 6s between pages
+            time.sleep(7.5)  # Safeline WAF: strict IP rate limit, need 7.5s between pages (reduced 468 risk)
         except Exception as e:
             err_str = str(e)
             if "safeline" in err_str.lower() or "468" in err_str or "403" in err_str or "503" in err_str:

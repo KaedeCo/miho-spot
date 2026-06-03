@@ -1,4 +1,4 @@
-import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult, BiliProfileSummary, BiliProfileDetail, BiliProfileItems } from "../types";
+import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult, BiliProfileSummary, BiliProfileDetail, BiliProfileItems, SavedVaTask, WordCloudItem, DeepAnalysisItem, KolUser, IdentityQueueItem } from "../types";
 
 const BASE_URL = "/api";
 
@@ -208,4 +208,104 @@ export async function exportBiliProfiles(): Promise<Response> {
 
 export async function importBiliProfiles(profiles: any[]): Promise<{ ok: boolean; imported: number; updated: number; total: number; message: string }> {
   return fetchJSON("/bilibili/import", { method: "POST", body: JSON.stringify({ profiles, mode: "merge" }) });
+}
+
+// ========== Video Analysis API ==========
+
+export async function getVaTasks(): Promise<VaTask[]> {
+  return fetchJSON<VaTask[]>("/video-analysis/tasks");
+}
+
+export async function vaFetchComments(url: string): Promise<{ ok: boolean; taskId?: string; bvid?: string; title?: string; message: string }> {
+  return fetchJSON("/video-analysis/fetch", { method: "POST", body: JSON.stringify({ url }) });
+}
+
+export async function getVaStatus(): Promise<VaStatus> {
+  return fetchJSON<VaStatus>("/video-analysis/status");
+}
+
+export async function vaAnalyze(taskId?: string): Promise<{ ok: boolean; taskId?: string; pendingCount?: number; message: string }> {
+  return fetchJSON("/video-analysis/analyze", { method: "POST", body: JSON.stringify({ taskId: taskId || "" }) });
+}
+
+export async function getVaResult(taskId: string): Promise<VaResult> {
+  return fetchJSON<VaResult>(`/video-analysis/result/${taskId}`);
+}
+
+export async function deleteVaTask(taskId: string): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/video-analysis/task/${taskId}`, { method: "DELETE" });
+}
+
+// ========== Saved Video Analysis Tasks ==========
+
+export async function saveVaTask(taskId: string): Promise<{ ok: boolean; id?: number; message: string }> {
+  return fetchJSON("/video-analysis/saved", { method: "POST", body: JSON.stringify({ taskId }) });
+}
+
+export async function getSavedVaTasks(): Promise<{ items: SavedVaTask[]; total: number }> {
+  return fetchJSON("/video-analysis/saved");
+}
+
+export async function deleteSavedVaTask(savedId: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/video-analysis/saved/${savedId}`, { method: "DELETE" });
+}
+
+// ========== Word Cloud ==========
+
+export async function generateWordCloud(savedTaskId: number): Promise<{ ok: boolean; id?: number; wordCount?: number; words?: any[]; message: string }> {
+  return fetchJSON("/word-cloud/generate", { method: "POST", body: JSON.stringify({ savedTaskId }) });
+}
+
+export async function getWordClouds(): Promise<{ items: WordCloudItem[]; total: number }> {
+  return fetchJSON("/word-cloud/list");
+}
+
+export async function deleteWordCloud(wcId: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/word-cloud/${wcId}`, { method: "DELETE" });
+}
+
+// ========== Deep Analysis ==========
+
+export async function startDeepAnalysis(savedTaskId: number): Promise<{ ok: boolean; analysisId?: number; message: string }> {
+  return fetchJSON("/deep-analysis/start", { method: "POST", body: JSON.stringify({ savedTaskId }) });
+}
+
+export async function getDeepAnalysisStatus(): Promise<{ status: string; progress: string; analysis_id: number | null }> {
+  return fetchJSON("/deep-analysis/status");
+}
+
+export async function getDeepAnalyses(): Promise<{ items: DeepAnalysisItem[]; total: number }> {
+  return fetchJSON("/deep-analysis/list");
+}
+
+export async function getDeepAnalysisResult(analysisId: number): Promise<DeepAnalysisItem & { rawResponse?: string }> {
+  return fetchJSON(`/deep-analysis/result/${analysisId}`);
+}
+
+export async function deleteDeepAnalysis(analysisId: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/deep-analysis/${analysisId}`, { method: "DELETE" });
+}
+
+// ========== KOL Top Users ==========
+
+export async function getKolTopUsers(taskId: string, sort: "hot" | "time" = "hot"): Promise<{ users: KolUser[]; sort: string; taskId: string; error?: string }> {
+  return fetchJSON(`/video-analysis/kol-top?task_id=${taskId}&sort=${sort}`);
+}
+
+// ========== Identity Queue ==========
+
+export async function getIdentityQueue(): Promise<{ items: IdentityQueueItem[]; total: number }> {
+  return fetchJSON("/identity-queue");
+}
+
+export async function addToIdentityQueue(uid: number, name?: string, face?: string, source?: string): Promise<{ ok: boolean; id?: number; message: string }> {
+  return fetchJSON("/identity-queue", { method: "POST", body: JSON.stringify({ uid, name: name || "", face: face || "", source: source || "manual" }) });
+}
+
+export async function removeFromIdentityQueue(qId: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/identity-queue/${qId}`, { method: "DELETE" });
+}
+
+export async function reorderIdentityQueue(orderedIds: number[]): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON("/identity-queue/reorder", { method: "PUT", body: JSON.stringify({ orderedIds }) });
 }
