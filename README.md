@@ -57,12 +57,12 @@ v1.3 是一次全面的稳定性攻坚版本，聚焦于前端组件协调、后
 
 ```mermaid
 flowchart TD
-    subgraph 数据采集层
+    subgraph L1 ["数据采集层"]
         A1[Tophub API<br/>付费关键词搜索] --> B1[YYYYMMDD.json<br/>日期快照 150 条]
         A2[知乎/抖音/贴吧<br/>免费热榜爬取] --> B2[hot_crawl.json<br/>累积热榜 300+ 条]
     end
 
-    subgraph 启动同步管道 [startup 启动同步管道]
+    subgraph L2 ["启动同步管道"]
         B1 --> C1[sync_hot_topics_from_json]
         B2 --> C1
         C1 -->|ID 去重 Upsert| D1[(hot_topics 表)]
@@ -74,21 +74,21 @@ flowchart TD
         C4 -->|逐日 Upsert| D2[(daily_stats 表)]
     end
 
-    subgraph 运行时处理层
+    subgraph L3 ["运行时处理层"]
         D1 --> E1[情感分析引擎<br/>关键词匹配 + SnowNLP]
         D1 --> E2[DeepSeek AI<br/>批量增强分析]
         E1 --> E3[内存缓存<br/>_hot_cache + _search_cache]
         E2 --> E3
     end
 
-    subgraph API 服务层 [FastAPI REST]
+    subgraph L4 ["API 服务层"]
         E3 --> F1[GET /dashboard]
         D2 --> F2[GET /stats/daily]
         D1 --> F3[GET /topics]
         D1 --> F4[GET /bilibili/*]
     end
 
-    subgraph 前端展示层 [React 19 + TDesign + Recharts]
+    subgraph L5 ["前端展示层"]
         F1 --> G1[Dashboard 仪表盘]
         F2 --> G2[History 历史统计]
         F3 --> G3[HotTopics 热搜列表]
@@ -97,11 +97,11 @@ flowchart TD
         F4 --> G6[VideoAnalysis 视频分析]
     end
 
-    style 启动同步管道 fill:#1a1a3e,stroke:#6366f1
-    style 数据采集层 fill:#1a2a1a,stroke:#22c55e
-    style 运行时处理层 fill:#2a1a1a,stroke:#ef4444
-    style API 服务层 fill:#1a1a2a,stroke:#f59e0b
-    style 前端展示层 fill:#1a1a3e,stroke:#a78bfa
+    style L1 fill:#1a2a1a,stroke:#22c55e
+    style L2 fill:#1a1a3e,stroke:#6366f1
+    style L3 fill:#2a1a1a,stroke:#ef4444
+    style L4 fill:#1a1a2a,stroke:#f59e0b
+    style L5 fill:#1a1a3e,stroke:#a78bfa
 ```
 
 ### 数据存储三层模型
