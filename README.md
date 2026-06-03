@@ -81,11 +81,11 @@ flowchart TD
         E2 --> E3
     end
 
-    subgraph API 服务层 [FastAPI REST 端点]
-        E3 --> F1[/api/dashboard]
-        D2 --> F2[/api/stats/daily]
-        D1 --> F3[/api/topics]
-        D1 --> F4[/api/bilibili/*]
+    subgraph API 服务层 [FastAPI REST]
+        E3 --> F1[GET /dashboard]
+        D2 --> F2[GET /stats/daily]
+        D1 --> F3[GET /topics]
+        D1 --> F4[GET /bilibili/*]
     end
 
     subgraph 前端展示层 [React 19 + TDesign + Recharts]
