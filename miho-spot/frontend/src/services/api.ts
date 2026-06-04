@@ -1,4 +1,4 @@
-import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult, BiliProfileSummary, BiliProfileDetail, BiliProfileItems, SavedVaTask, WordCloudItem, DeepAnalysisItem, KolUser, IdentityQueueItem } from "../types";
+import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry, AccountCredential, Platform, TimeRange, CategoryEntry, BiliUserInfo, BiliAnalyzeStatus, BiliAnalyzeResult, BiliProfileSummary, BiliProfileDetail, BiliProfileItems, SavedVaTask, WordCloudItem, DeepAnalysisItem, KolUser, IdentityQueueItem, OtTask, OtStatus, OtResult, SavedOtTask } from "../types";
 
 const BASE_URL = "/api";
 
@@ -178,10 +178,10 @@ export async function getBiliAnalyzeResult(uid: number, page: number = 1, pageSi
   return fetchJSON(`/bilibili/analyze/result?uid=${uid}&page=${page}&page_size=${pageSize}`);
 }
 
-export async function triggerBiliAnalyze(uid: number, maxVideos: number = 50, maxComments: number = 500, monthsLimit: number = 6): Promise<{ ok: boolean; message?: string; uid?: number; error?: string }> {
+export async function triggerBiliAnalyze(uid: number, maxVideos: number = 50, maxComments: number = 500, monthsLimit: number = 6, maxTotal?: number): Promise<{ ok: boolean; message?: string; uid?: number; error?: string }> {
   return fetchJSON("/bilibili/analyze", {
     method: "POST",
-    body: JSON.stringify({ uid, max_videos: maxVideos, max_comments_per_video: maxComments, months_limit: monthsLimit }),
+    body: JSON.stringify({ uid, max_videos: maxVideos, max_comments_per_video: maxComments, months_limit: monthsLimit, max_total: maxTotal || null }),
   });
 }
 
@@ -308,4 +308,118 @@ export async function removeFromIdentityQueue(qId: number): Promise<{ ok: boolea
 
 export async function reorderIdentityQueue(orderedIds: number[]): Promise<{ ok: boolean; message: string }> {
   return fetchJSON("/identity-queue/reorder", { method: "PUT", body: JSON.stringify({ orderedIds }) });
+}
+
+// ========== Opinion Timeline API (舆情推演) ==========
+
+export async function otFetch(url: string): Promise<{ ok: boolean; taskId?: string; bvid?: string; message: string }> {
+  return fetchJSON("/opinion-timeline/fetch", { method: "POST", body: JSON.stringify({ url }) });
+}
+
+export async function otStatus(): Promise<OtStatus> {
+  return fetchJSON<OtStatus>("/opinion-timeline/status");
+}
+
+export async function otAnalyze(taskId: string): Promise<{ ok: boolean; taskId?: string; message: string }> {
+  return fetchJSON("/opinion-timeline/analyze", { method: "POST", body: JSON.stringify({ taskId }) });
+}
+
+export async function otResult(taskId: string): Promise<OtResult> {
+  return fetchJSON<OtResult>(`/opinion-timeline/result/${taskId}`);
+}
+
+export async function otListTasks(): Promise<{ items: OtTask[]; total: number }> {
+  return fetchJSON("/opinion-timeline/tasks");
+}
+
+export async function otDeleteTask(taskId: string): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/opinion-timeline/task/${taskId}`, { method: "DELETE" });
+}
+
+export async function otSave(taskId: string, nodeIndices?: number[]): Promise<{ ok: boolean; id?: number; message: string }> {
+  return fetchJSON("/opinion-timeline/saved", { method: "POST", body: JSON.stringify({ taskId, nodeIndices }) });
+}
+
+export async function otListSaved(): Promise<{ items: SavedOtTask[]; total: number }> {
+  return fetchJSON("/opinion-timeline/saved");
+}
+
+export async function otGetSaved(savedId: number): Promise<OtResult> {
+  return fetchJSON<OtResult>(`/opinion-timeline/saved/${savedId}`);
+}
+
+export async function otDeleteSaved(savedId: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/opinion-timeline/saved/${savedId}`, { method: "DELETE" });
+}
+
+export async function otSaveNodes(savedId: number, nodeIndices: number[]): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/opinion-timeline/saved/${savedId}/nodes`, { method: "POST", body: JSON.stringify({ nodeIndices }) });
+}
+
+// ========== Cluster Analysis API ==========
+import type { ClusterResult } from "../types";
+
+export async function clusterAnalyze(savedId: number): Promise<{ ok: boolean; id?: number; clusterCount: number; clusters: any[] }> {
+  return fetchJSON("/cluster/analyze", { method: "POST", body: JSON.stringify({ savedId }) });
+}
+
+export async function clusterGet(id: number): Promise<ClusterResult> {
+  return fetchJSON(`/cluster/result/${id}`);
+}
+
+export async function clusterBySaved(savedId: number): Promise<ClusterResult> {
+  return fetchJSON(`/cluster/by-saved/${savedId}`);
+}
+
+export async function clusterList(): Promise<{ items: any[]; total: number }> {
+  return fetchJSON("/cluster/list");
+}
+
+export async function clusterDelete(id: number): Promise<{ ok: boolean; message: string }> {
+  return fetchJSON(`/cluster/${id}`, { method: "DELETE" });
+}
+
+// ========== PDF Report API ==========
+
+export interface PdfModule {
+  key: string;
+  label: string;
+  description: string;
+}
+
+export async function getPdfModules(): Promise<{ modules: PdfModule[] }> {
+  return fetchJSON("/pdf-report/modules");
+}
+
+export interface PdfJobProgress {
+  status: string;
+  step: number;
+  total: number;
+  message: string;
+  error?: string;
+}
+
+export async function generatePdfReport(savedId: number, modules: string[]): Promise<{ jobId: string }> {
+  return fetchJSON("/pdf-report/generate", {
+    method: "POST",
+    body: JSON.stringify({ savedId, modules }),
+  });
+}
+
+export async function getPdfProgress(jobId: string): Promise<PdfJobProgress> {
+  return fetchJSON(`/pdf-report/progress/${jobId}`);
+}
+
+export async function downloadPdfReport(jobId: string): Promise<void> {
+  const resp = await fetch(`/api/pdf-report/download/${jobId}`);
+  if (!resp.ok) throw new Error("下载失败");
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `miho_spot_report_${jobId.slice(0, 8)}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }

@@ -352,3 +352,89 @@ export interface IdentityQueueItem {
   status: "pending" | "running" | "done" | "error";
   addedAt: string;
 }
+
+// ========== Opinion Timeline Types (舆情推演) ==========
+
+export interface OtTask {
+  id: string;
+  bvid: string;
+  aid: number;
+  title: string;
+  coverUrl: string;
+  url: string;
+  status: "idle" | "fetching" | "fetched" | "analyzing" | "done" | "error";
+  errorMsg: string;
+  totalComments: number;
+  analyzedCount: number;
+  centroidX: number;
+  centroidY: number;
+  timeStart: number;
+  timeEnd: number;
+  nodeIndices?: number[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OtStatus {
+  task_id: string | null;
+  status: string;
+  progress: string;
+}
+
+export interface OtCentroidTrailPoint {
+  x: number;
+  y: number;
+  t: string;     // time label e.g. "06-04 18:30"
+  count: number;
+}
+
+export interface OtResult {
+  task: OtTask;
+  heatmapGrid: number[][] | null;     // 101x101 grid[x][y] = count
+  centroidTrail: OtCentroidTrailPoint[];
+}
+
+export interface SavedOtTask {
+  id: number;
+  sourceTaskId: string;
+  bvid: string;
+  title: string;
+  coverUrl: string;
+  totalComments: number;
+  analyzedCount: number;
+  centroidX: number;
+  centroidY: number;
+  timeStart: number;
+  timeEnd: number;
+  nodeIndices?: number[];
+  savedAt: string;
+}
+
+// ========== Cluster Analysis Types (聚类分群) ==========
+
+export interface ClusterDeepseek {
+  definition: string;
+  coreClaim: string;
+  arguments: string[];
+  materialBasis: string;
+}
+
+export interface ClusterGroup {
+  id: number;
+  centroid: { x: number; y: number };
+  memberCount: number;
+  percentage: number;
+  boundary: number[][];  // [[x,y], [x,y], ...] convex hull
+  deepseek: ClusterDeepseek | null;
+}
+
+export interface ClusterResult {
+  id: number | null;
+  savedTimelineId: number;
+  bvid: string;
+  title: string;
+  totalComments: number;
+  clusterCount: number;
+  clusters: ClusterGroup[];
+  createdAt: string;
+}

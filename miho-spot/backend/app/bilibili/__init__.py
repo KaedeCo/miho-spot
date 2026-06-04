@@ -191,23 +191,27 @@ def _aicu_get_simple(url: str, params: dict = None) -> dict:
 async def fetch_user_video_comments(
     uid: int, max_videos: int = 50,
     max_comments_per_video: int = 500,
-    months_limit: int = 6
+    months_limit: int = 6,
+    max_total: int = None
 ) -> List[dict]:
     """
     Fetch user's video comments via AICU API.
     AICU returns ALL video comments the user has ever made.
     We first try the time window; if 0 results, fall back to all data.
+    If max_total is set, fetching stops once enough comments are collected.
     """
     import asyncio
 
     cutoff_ts = (datetime.utcnow() - timedelta(days=months_limit * 30)).timestamp()
-    print(f"[Bilibili] Fetching AICU comments for uid={uid}, months_limit={months_limit}, cutoff={datetime.utcfromtimestamp(cutoff_ts)}")
+    limit = max_total or 2000
+    print(f"[Bilibili] Fetching AICU comments for uid={uid}, months_limit={months_limit}, max_total={max_total}, cutoff={datetime.utcfromtimestamp(cutoff_ts)}")
 
     raw_comments = []
     page = 1
-    max_results = 2000  # safety cap
+    max_results = min(limit, max_total or 2000)  # safety cap, respects user limit
+    pages_needed = (limit + 99) // 100
 
-    while len(raw_comments) < max_results:
+    while len(raw_comments) < max_results and page <= pages_needed:
         try:
             data = await asyncio.to_thread(
                 _aicu_get,

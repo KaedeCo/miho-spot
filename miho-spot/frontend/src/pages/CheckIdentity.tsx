@@ -74,13 +74,18 @@ export default function CheckIdentity() {
   const [page, setPage] = useState(1);
   const [error, setError] = useState("");
   const [tabValue, setTabValue] = useState("comments");
+  const [maxTotal, setMaxTotal] = useState<number | "unlimited">(500);
+  const [progressStep, setProgressStep] = useState(0);
+  const [progressMsg, setProgressMsg] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Identity queue
   const [queueItems, setQueueItems] = useState<IdentityQueueItem[]>([]);
   const [showQueue, setShowQueue] = useState(true);
+  const [queueRunning, setQueueRunning] = useState(false);
   const queueRef = useRef<HTMLDivElement | null>(null);
   const dragItemRef = useRef<number | null>(null);
+  const stopRef = useRef(false);
 
   useEffect(() => { return () => { if (pollRef.current) clearInterval(pollRef.current); }; }, []);
 
@@ -107,16 +112,20 @@ export default function CheckIdentity() {
 
     setAnalyzing(true); setResult(null);
     try {
-      const triggerRes = await triggerBiliAnalyze(uidNum);
+      const mt = maxTotal === "unlimited" ? undefined : maxTotal;
+      const triggerRes = await triggerBiliAnalyze(uidNum, 50, 500, 6, mt);
       if (!triggerRes.ok) { setError(triggerRes.error || "触发分析失败"); setAnalyzing(false); return; }
       MessagePlugin.info(triggerRes.message || "分析已启动");
+      setProgressStep(0); setProgressMsg("正在获取用户信息...");
       pollRef.current = setInterval(async () => {
         try {
           const status = await getBiliAnalyzeStatus(uidNum);
+          setProgressStep(status.progress_step || 0);
+          setProgressMsg(status.progress_msg || "");
           if (status.status === "done") { clearInterval(pollRef.current!); setAnalyzing(false); await loadResult(uidNum, 1); }
           else if (status.status === "error") { clearInterval(pollRef.current!); setAnalyzing(false); setError("分析过程出错，请重试"); }
         } catch {}
-      }, 2000);
+      }, 1500);
     } catch (e: any) { setAnalyzing(false); setError(`触发分析失败: ${e.message}`); }
   }, [uid, loadResult]);
 
@@ -137,17 +146,21 @@ export default function CheckIdentity() {
   const handleRefetch = useCallback(async () => {
     const uidNum = parseInt(uid.trim()); if (!uidNum) return;
     setAnalyzing(true); setResult(null);
+    const mt = maxTotal === "unlimited" ? undefined : maxTotal;
     try {
-      await triggerBiliAnalyze(uidNum);
+      await triggerBiliAnalyze(uidNum, 50, 500, 6, mt);
+      setProgressStep(0); setProgressMsg("正在获取用户信息...");
       pollRef.current = setInterval(async () => {
         try {
           const status = await getBiliAnalyzeStatus(uidNum);
+          setProgressStep(status.progress_step || 0);
+          setProgressMsg(status.progress_msg || "");
           if (status.status === "done") { clearInterval(pollRef.current!); setAnalyzing(false); await loadResult(uidNum, 1); }
           else if (status.status === "error") { clearInterval(pollRef.current!); setAnalyzing(false); setError("分析过程出错"); }
         } catch {}
-      }, 2000);
+      }, 1500);
     } catch (e: any) { setAnalyzing(false); setError(e.message); }
-  }, [uid, loadResult]);
+  }, [uid, loadResult, maxTotal]);
 
   // Queue management
   const loadQueue = useCallback(async () => {
@@ -175,6 +188,79 @@ export default function CheckIdentity() {
       setQueueItems(queueItems.filter((q) => q.id !== qId));
       MessagePlugin.success("已移除");
     } catch (e: any) { MessagePlugin.error(e.message); }
+  };
+
+  /** Process all pending queue items sequentially, stop on user request or errors */
+  const handleProcessQueue = async () => {
+    const pending = queueItems.filter(q => q.status === "pending");
+    if (!pending.length) { MessagePlugin.warning("队列中没有待处理的任务"); return; }
+
+    setQueueRunning(true);
+    stopRef.current = false;
+    MessagePlugin.info(`开始处理 ${pending.length} 个队列任务`);
+
+    for (const item of pending) {
+      if (stopRef.current) break;
+
+      // Mark as running
+      setQueueItems(prev => prev.map(q => q.id === item.id ? { ...q, status: "running" as const } : q));
+
+      try {
+        const mt = maxTotal === "unlimited" ? undefined : maxTotal;
+        setProgressStep(0);
+        setProgressMsg(`队列任务: ${item.name || `UID:${item.uid}`} 开始...`);
+        const triggerRes = await triggerBiliAnalyze(item.uid, 50, 500, 6, mt);
+        if (!triggerRes.ok) {
+          setQueueItems(prev => prev.map(q => q.id === item.id ? { ...q, status: "error" as const } : q));
+          continue;
+        }
+
+        // Poll for completion
+        await new Promise<void>((resolve) => {
+          const iv = setInterval(async () => {
+            if (stopRef.current) {
+              clearInterval(iv);
+              setQueueItems(prev => prev.map(q => q.id === item.id ? { ...q, status: "pending" as const } : q));
+              resolve(); return;
+            }
+            try {
+              const status = await getBiliAnalyzeStatus(item.uid);
+              setProgressStep(status.progress_step || 0);
+              setProgressMsg(status.progress_msg || `队列任务: ${item.name || `UID:${item.uid}`}`);
+              if (status.status === "done") {
+                clearInterval(iv);
+                // Auto-save to DB so avatar appears on spectrum
+                try { await saveBiliProfile(item.uid); } catch {}
+                setQueueItems(prev => prev.map(q => q.id === item.id ? { ...q, status: "done" as const } : q));
+                resolve();
+              } else if (status.status === "error") {
+                clearInterval(iv);
+                setQueueItems(prev => prev.map(q => q.id === item.id ? { ...q, status: "error" as const } : q));
+                resolve();
+              }
+            } catch { }
+          }, 2000);
+        });
+      } catch {
+        setQueueItems(prev => prev.map(q => q.id === item.id ? { ...q, status: "error" as const } : q));
+      }
+    }
+
+    // If stopped, revert any running item back to pending
+    if (stopRef.current) {
+      setQueueItems(prev => prev.map(q => q.status === "running" ? { ...q, status: "pending" as const } : q));
+    }
+    setQueueRunning(false);
+    if (stopRef.current) {
+      MessagePlugin.info("队列处理已手动停止");
+    } else {
+      MessagePlugin.success("队列任务处理完毕");
+    }
+  };
+
+  const handleStopQueue = () => {
+    stopRef.current = true;
+    MessagePlugin.warning("正在停止队列...");
   };
 
   const handleDragStart = (e: React.DragEvent, id: number) => {
@@ -218,17 +304,56 @@ export default function CheckIdentity() {
       </div>
 
       {/* Search */}
-      <div className="glass-card p-5 rounded-xl">
-        <div className="flex items-center gap-3">
+      <div className="glass-card p-5 rounded-xl space-y-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <Input value={uid} onChange={(v) => setUid(v as string)} placeholder="输入B站用户UID" size="large"
-            disabled={analyzing} className="flex-1" prefixIcon={<UserIcon />}
+            disabled={analyzing || queueRunning} className="flex-1 min-w-[200px]" prefixIcon={<UserIcon />}
             onKeydown={(e: any) => { if (e.key === "Enter") handleSearch(); }} />
+          <select
+            className="bg-[#1e293b] border border-[#334155] rounded px-2 py-2 text-sm text-white"
+            value={String(maxTotal)}
+            onChange={e => setMaxTotal(e.target.value === "unlimited" ? "unlimited" : Number(e.target.value))}
+            disabled={analyzing || queueRunning}
+          >
+            <option value="100">100条</option>
+            <option value="200">200条</option>
+            <option value="500">500条</option>
+            <option value="1000">1000条</option>
+            <option value="unlimited">不限</option>
+          </select>
           <Button size="large" theme="primary" icon={<SearchIcon />} onClick={handleSearch}
-            loading={loading} disabled={analyzing || !uid.trim()}>开始分析</Button>
+            loading={loading} disabled={analyzing || queueRunning || !uid.trim()}>开始分析</Button>
           <Button size="large" variant="outline" icon={<ViewListIcon />}
-            onClick={handleAddToQueue} disabled={!uid.trim()}
+            onClick={handleAddToQueue} disabled={!uid.trim() || queueRunning}
             title="将UID加入查成分队列">加入队列</Button>
+          {queueItems.length > 0 && !queueRunning && (
+            <Button size="large" theme="warning" icon={<PlayCircleIcon />}
+              onClick={handleProcessQueue}>
+              执行队列 ({queueItems.filter(q => q.status === "pending").length})
+            </Button>
+          )}
+          {queueRunning && (
+            <Button size="large" theme="danger" onClick={handleStopQueue}>
+              停止队列
+            </Button>
+          )}
         </div>
+        {/* Progress bar — show for both manual and queue analysis */}
+        {(analyzing || queueRunning) && (
+          <div className="bg-[#1e293b] rounded-lg p-3 border border-[#334155] space-y-2">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-[#94a3b8]">{progressMsg || "准备中..."}</span>
+              <span className="text-white font-mono">{Math.min(100, Math.round((progressStep / 5) * 100))}%</span>
+            </div>
+            <div className="w-full h-2 bg-[#0f172a] rounded-full overflow-hidden">
+              <div className="h-full rounded-full transition-all duration-500" style={{
+                width: `${Math.min(100, (progressStep / 5) * 100)}%`,
+                background: "linear-gradient(to right, #6366f1, #a855f7)",
+              }} />
+            </div>
+            <div className="text-[10px] text-[#64748b]">步骤 {progressStep}/5</div>
+          </div>
+        )}
       </div>
 
       {/* Identity Queue Panel */}
@@ -266,8 +391,9 @@ export default function CheckIdentity() {
                   <div className="text-[10px] text-gray-500">UID:{q.uid} · {q.source === "video_analysis_kol" ? "视频分析KOL" : "手动添加"} · {q.addedAt.slice(11, 16)}</div>
                 </div>
                 {q.status === "pending" && <Tag size="small" variant="light" theme="default" className="shrink-0">排队中</Tag>}
-                {q.status === "running" && <Tag size="small" variant="light" theme="warning" className="shrink-0"><Loading size="12px" /></Tag>}
+                {q.status === "running" && <Tag size="small" variant="light" theme="warning" className="shrink-0"><Loading size="12px" /> 分析中</Tag>}
                 {q.status === "done" && <Tag size="small" variant="light" theme="success" className="shrink-0">完成</Tag>}
+                {q.status === "error" && <Tag size="small" variant="light" theme="danger" className="shrink-0">出错</Tag>}
                 {(q.status === "pending") && (
                   <button
                     className="p-1 rounded hover:bg-red-500/20 shrink-0"
@@ -283,7 +409,6 @@ export default function CheckIdentity() {
       </div>
 
       {error && <div className="glass-card p-4 rounded-xl border border-red-500/30 bg-red-500/5 text-red-400">{error}</div>}
-      {analyzing && <div className="glass-card p-8 rounded-xl flex flex-col items-center gap-4"><Loading size="large" text="正在扫描数据..." /><p className="text-xs text-gray-500">拉取评论+视频/专栏，此过程可能需要1-3分钟</p></div>}
 
       {/* User Info */}
       {userInfo && result && (

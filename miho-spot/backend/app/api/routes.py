@@ -14,7 +14,7 @@ import json
 
 from app.models import get_db, SessionLocal, init_db
 from app.models import HotTopicModel, PostItemModel, DailyStatsModel, KeywordModel, AccountModel, BiliUserProfile, VideoAnalysisTask, VideoComment
-from app.models import SavedVaTask, WordCloudItem, DeepAnalysis, IdentityQueue
+from app.models import SavedVaTask, WordCloudItem, DeepAnalysis, IdentityQueue, OpinionTimelineTask, SavedOpinionTimelineTask, ClusterAnalysis
 from app.crawlers import get_crawler
 
 router = APIRouter(prefix="/api")
@@ -1572,6 +1572,8 @@ async def verify(platform: str, body: dict = None):
     cookie = (body or {}).get("cookie", "")
     if platform == "tophub":
         return _verify_tophub(cookie)
+    if platform == "bilibili":
+        return _verify_bilibili(cookie)
     if not cookie:
         db = SessionLocal()
         a = db.query(AccountModel).filter(AccountModel.platform == platform).first()
@@ -1588,6 +1590,92 @@ async def verify(platform: str, body: dict = None):
         db.commit()
     db.close()
     return {"isValid": v, "message": "Cookie有效" if v else "Cookie过短"}
+
+
+def _verify_bilibili(cookie: str = "") -> dict:
+    """Verify B站 cookie by calling the user info API.
+    Returns {isValid, message, userInfo?}"""
+    import httpx as _httpx
+
+    if not cookie:
+        db = SessionLocal()
+        acc = db.query(AccountModel).filter(AccountModel.platform == "bilibili").first()
+        cookie = acc.cookie if acc else ""
+        db.close()
+
+    if not cookie:
+        return {"isValid": False, "message": "请先配置Cookie"}
+
+    # Check SESSDATA presence
+    has_sessdata = False
+    for part in cookie.split(";"):
+        key = part.strip().split("=")[0].strip() if "=" in part else ""
+        if key == "SESSDATA" and len(part.split("=", 1)) > 1 and len(part.split("=", 1)[1].strip()) > 10:
+            has_sessdata = True
+            break
+
+    if not has_sessdata:
+        return {"isValid": False, "message": "缺少必需的 SESSDATA 字段，请至少填写SESSDATA"}
+
+    try:
+        print(f"[Verify-Bili] Testing cookie (length={len(cookie)})...")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.bilibili.com",
+            "Referer": "https://www.bilibili.com/",
+            "Cookie": cookie,
+        }
+
+        # Try with curl_cffi first for better anti-bot bypass
+        try:
+            from curl_cffi import requests as cffi_requests
+            resp = cffi_requests.get(
+                "https://api.bilibili.com/x/web-interface/nav",
+                headers=headers,
+                impersonate="chrome131",
+                timeout=15,
+            )
+        except ImportError:
+            resp = _httpx.get(
+                "https://api.bilibili.com/x/web-interface/nav",
+                headers=headers,
+                timeout=15,
+            )
+
+        data = resp.json()
+        code = data.get("code", -1)
+
+        if code == 0:
+            info = data.get("data", {})
+            uname = info.get("uname", "未知用户")
+            mid = info.get("mid", "")
+            level = info.get("level_info", {}).get("current_level", "?")
+            vip_status = "大会员" if info.get("vipStatus") else "普通用户"
+            print(f"[Verify-Bili] OK: {uname} (Lv.{level})")
+            # Mark as valid in DB
+            db = SessionLocal()
+            a = db.query(AccountModel).filter(AccountModel.platform == "bilibili").first()
+            if a:
+                a.is_valid = True
+                a.last_verified = datetime.utcnow()
+                a.username = str(mid)  # store UID
+                db.commit()
+            db.close()
+            return {
+                "isValid": True,
+                "message": f"验证成功！用户: {uname} | 等级: Lv.{level} | 身份: {vip_status}",
+                "userInfo": {"uname": uname, "mid": mid, "level": level, "vipStatus": info.get("vipStatus")},
+            }
+        elif code == -101:
+            return {"isValid": False, "message": "Cookie已失效或未登录，请重新获取SESSDATA"}
+        else:
+            msg = data.get("message", f"未知错误(code:{code})")
+            return {"isValid": False, "message": f"B站API返回错误: {msg}"}
+
+    except Exception as e:
+        print(f"[Verify-Bili] Exception: {e}")
+        return {"isValid": False, "message": f"验证请求失败: {str(e)}"}
 
 
 def _verify_tophub(api_key=""):
@@ -1638,24 +1726,38 @@ _bili_analysis_cache: dict = {}
 _bili_analysis_lock = threading.Lock()
 
 
-def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_limit: int):
+def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_limit: int, max_total=None):
     """Background task: fetch comments, filter, and analyze with DeepSeek."""
     global _bili_analysis_cache
     import traceback as _tb
+
+    def _progress(step, msg):
+        with _bili_analysis_lock:
+            entry = _bili_analysis_cache.get(str(uid), {})
+            entry.update({"status": "processing", "progress_step": step, "progress_msg": msg})
+            _bili_analysis_cache[str(uid)] = entry
+
     try:
-        print(f"[BiliAnalyze] Starting analysis for uid={uid}")
+        print(f"[BiliAnalyze] Starting analysis for uid={uid}, max_total={max_total}")
+        _progress(0, "正在获取用户信息...")
         loop = _asyncio_mod.new_event_loop()
         _asyncio_mod.set_event_loop(loop)
         from app.bilibili import fetch_user_video_comments, fetch_user_content, filter_comments_by_keywords, analyze_user_personality, get_user_info
         print(f"[BiliAnalyze] Fetching user info...")
         user_info = loop.run_until_complete(get_user_info(uid))
         print(f"[BiliAnalyze] User: {user_info.get('name')}")
+        _progress(1, f"正在拉取评论（上限{max_total or '不限'}条）...")
         print(f"[BiliAnalyze] Fetching comments...")
         all_comments = loop.run_until_complete(
             fetch_user_video_comments(uid, max_videos=max_videos,
                                        max_comments_per_video=max_comments,
-                                       months_limit=months_limit)
+                                       months_limit=months_limit,
+                                       max_total=max_total)
         )
+        # Apply total limit
+        if max_total and len(all_comments) > max_total:
+            all_comments = all_comments[:max_total]
+        _progress(2, f"已获取 {len(all_comments)} 条评论，正在获取视频...")
         print(f"[BiliAnalyze] Fetching video/articles...")
         user_content = loop.run_until_complete(fetch_user_content(uid))
         loop.close()
@@ -1663,10 +1765,12 @@ def _run_bili_analyze_sync(uid: int, max_videos: int, max_comments: int, months_
 
         # Filter by keywords (for marking, not for exclusion)
         print(f"[BiliAnalyze] Filtering by keywords...")
+        _progress(3, f"正在关键词匹配 ({len(all_comments)} 条评论)...")
         matched_comments = filter_comments_by_keywords(all_comments)
         print(f"[BiliAnalyze] {len(matched_comments)} comments matched keywords")
 
         # DeepSeek personality analysis (always run if API key set, even 0 matched)
+        _progress(4, f"正在AI人格分析 (命中{len(matched_comments)}条)...")
         ds_key = _get_deepseek_key()
         print(f"[BiliAnalyze] DeepSeek configured: {bool(ds_key)}, matched={len(matched_comments)}, total={len(all_comments)}")
         spectrum = None
@@ -1750,6 +1854,8 @@ async def get_bili_analyze_status(uid: int):
             "uid": uid,
             "total_comments": result.get("total_comments", 0),
             "matched_count": result.get("matched_count", 0),
+            "progress_step": result.get("progress_step", 0),
+            "progress_msg": result.get("progress_msg", ""),
             "score": result.get("spectrum", {}).get("score"),
             "analyzed_at": result.get("analyzed_at", ""),
         }
@@ -1806,6 +1912,7 @@ async def trigger_bili_analyze(body: dict):
     max_videos = int(body.get("max_videos", 50))
     max_comments = int(body.get("max_comments_per_video", 500))
     months_limit = int(body.get("months_limit", 6))
+    max_total = body.get("max_total")  # None = unlimited, or 100/200/500/1000
 
     # Check if already analyzing
     with _bili_analysis_lock:
@@ -1817,7 +1924,7 @@ async def trigger_bili_analyze(body: dict):
 
     threading.Thread(
         target=_run_bili_analyze_sync,
-        args=(uid, max_videos, max_comments, months_limit),
+        args=(uid, max_videos, max_comments, months_limit, max_total),
         daemon=True,
     ).start()
 
@@ -2127,33 +2234,218 @@ def _bili_get_aid(bvid: str) -> tuple:
         return 0, "", "", str(e)
 
 
-def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500) -> list:
-    """Fetch comments from Bilibili reply API.
-    mode=3: hot sort, mode=2: time sort.
-    Returns list of comment dicts including sub-replies."""
-    import httpx
-    import time as _time
+def _get_bilibili_cookie() -> str:
+    """Read user-configured B站 cookie from accounts table. Returns '' if none."""
+    try:
+        db = SessionLocal()
+        try:
+            acct = db.query(AccountModel).filter(AccountModel.platform == "bilibili").first()
+            if acct and acct.is_valid and acct.cookie:
+                return acct.cookie.strip()
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return ""
 
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}
+
+def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500, *, use_uapis: bool = None) -> list:
+    """Fetch comments from Bilibili reply API.
+
+    Strategy (priority descending):
+      1. User B站 Cookie  — if configured in Accounts page, use curl_cffi + cookie → official API
+      2. UAPIS free proxy — if no cookie or cookie fails, use uapis.cn free API (1500 credits/month)
+      3. Direct official   — last resort without cookie (likely to hit -352)
+
+    mode=3: hot sort, mode=2/0: time sort.
+    Returns list of comment dicts including sub-replies."""
+    import time as _time
+    import httpx as _httpx
+
+    cookie = _get_bilibili_cookie()
+    channel = "unknown"
+
+    # ── Attempt 1: User Cookie + Official API ──
+    if cookie:
+        try:
+            from curl_cffi import requests as cffi_requests
+            _use_cffi = True
+        except ImportError:
+            _use_cffi = False
+
+        _cookie_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.bilibili.com",
+            "Referer": f"https://www.bilibili.com/video/av{aid}/",
+            "Cookie": cookie,
+        }
+        all_items = []
+        cursor = 0
+        page = 0
+        try:
+            while len(all_items) < max_count:
+                page += 1
+                if _use_cffi:
+                    resp = cffi_requests.get(
+                        "https://api.bilibili.com/x/v2/reply/main",
+                        params={"type": 1, "oid": aid, "mode": mode, "next": cursor, "ps": 20},
+                        headers=_cookie_headers, impersonate="chrome131", timeout=15,
+                    )
+                    d = resp.json()
+                else:
+                    resp = _httpx.get(
+                        "https://api.bilibili.com/x/v2/reply/main",
+                        params={"type": 1, "oid": aid, "mode": mode, "next": cursor, "ps": 20},
+                        headers=_cookie_headers, timeout=15,
+                    )
+                    d = resp.json()
+
+                if d.get("code") != 0:
+                    print(f"[Video-Fetch:COOKIE] Page {page} error ({d.get('code')}): {d.get('message')}")
+                    break
+
+                replies = d.get("data", {}).get("replies", [])
+                cur = d.get("data", {}).get("cursor", {})
+                is_end = cur.get("is_end", False)
+                cursor = cur.get("next", 0)
+
+                for r in replies:
+                    if len(all_items) >= max_count: break
+                    m = r.get("member", {})
+                    cobj = r.get("content", {})
+                    all_items.append({
+                        "rpid": r["rpid"], "parent_rpid": 0, "root_rpid": 0,
+                        "uid": m.get("mid", 0), "user": m.get("uname", ""),
+                        "content": cobj.get("message", "")[:500],
+                        "like_count": r.get("like", 0), "reply_count": r.get("rcount", 0),
+                        "ctime": r.get("ctime", 0),
+                        "sort_mode": "hot" if mode == 3 else "time",
+                        "matched_keywords": [],
+                    })
+                    # Fetch sub-replies
+                    rcount = r.get("rcount", 0)
+                    if rcount > 0:
+                        sub = _bili_fetch_sub_replies(aid, r["rpid"], max_count - len(all_items))
+                        all_items.extend(sub)
+
+                if is_end or not cursor: break
+                _time.sleep(0.3)
+
+            if all_items:
+                channel = "cookie"
+                print(f"[Video-Fetch:COOKIE] Got {len(all_items)} comments")
+                return all_items
+        except Exception as e:
+            print(f"[Video-Fetch:COOKIE] Failed: {e}, falling back to UAPIS")
+
+    # ── Attempt 2: UAPIS free proxy API ──
+    if use_uapis is not False:  # default True unless explicitly disabled
+        try:
+            # mode mapping: 3 → sort=1 (hot/like), 2 → sort=0 (time)
+            sort_map = {3: 1, 2: 0, 0: 0}
+            sort = sort_map.get(mode, 1)
+            all_items = []
+            pn = 1
+            ps = 50  # UAPIS allows up to 50 per page
+
+            while len(all_items) < max_count:
+                resp = _httpx.get(
+                    "https://uapis.cn/api/v1/social/bilibili/replies",
+                    params={"oid": aid, "sort": sort, "ps": ps, "pn": pn},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=20,
+                )
+                d = resp.json()
+                if d.get("code") != 200:
+                    print(f"[Video-Fetch:UAPIS] Page {pn} error: {d.get('msg', d)}")
+                    break
+
+                replies = d.get("data", {}).get("replies", [])
+                if not replies:
+                    break
+
+                page_info = d.get("data", {}).get("page", {})
+                total_count = page_info.get("count", 0)
+
+                for r in replies:
+                    if len(all_items) >= max_count: break
+                    all_items.append({
+                        "rpid": r.get("rpid", 0), "parent_rpid": r.get("parent", 0),
+                        "root_rpid": r.get("root", 0),
+                        "uid": r.get("mid", 0), "user": r.get("uname", ""),
+                        "content": r.get("message", "")[:500],
+                        "like_count": r.get("like", 0), "reply_count": r.get("rcount", 0),
+                        "ctime": r.get("ctime", 0),
+                        "sort_mode": "hot" if mode == 3 else "time",
+                        "matched_keywords": [],
+                    })
+
+                # Check if we've got all pages
+                if pn * ps >= total_count or len(replies) < ps:
+                    break
+                pn += 1
+                _time.sleep(0.3)
+
+            if all_items:
+                channel = "uapis"
+                print(f"[Video-Fetch:UAPIS] Got {len(all_items)} comments ({pn} pages)")
+                return all_items
+        except Exception as e:
+            print(f"[Video-Fetch:UAPIS] Failed: {e}, falling back to direct API")
+
+    # ── Attempt 3: Direct official API (last resort, likely blocked) ──
+    channel = "direct"
+    print("[Video-Fetch:DIRECT] Trying direct B站 API (may fail with -352)...")
+    try:
+        from curl_cffi import requests as cffi_requests
+        _use_cffi2 = True
+    except ImportError:
+        _use_cffi2 = False
+
+    import random as _random, string as _string
+    _buvid3 = "".join(_random.choices(_string.ascii_uppercase + _string.digits, k=20)) + "infoc"
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": f"https://www.bilibili.com/video/av{aid}/",
+        "Cookie": f"buvid3={_buvid3}; buvid4={_buvid3};",
+    }
     all_items = []
     cursor = 0
     page = 0
+    consecutive_352 = 0
 
     while len(all_items) < max_count:
         page += 1
         try:
-            resp = httpx.get(
-                "https://api.bilibili.com/x/v2/reply/main",
-                params={"type": 1, "oid": aid, "mode": mode, "next": cursor, "ps": 20},
-                headers=headers, timeout=15,
-            )
-            d = resp.json()
+            if _use_cffi2:
+                resp = cffi_requests.get(
+                    "https://api.bilibili.com/x/v2/reply/main",
+                    params={"type": 1, "oid": aid, "mode": mode, "next": cursor, "ps": 20},
+                    headers=_headers, impersonate="chrome131", timeout=15,
+                )
+                d = resp.json()
+            else:
+                resp = _httpx.get(
+                    "https://api.bilibili.com/x/v2/reply/main",
+                    params={"type": 1, "oid": aid, "mode": mode, "next": cursor, "ps": 20},
+                    headers=_headers, timeout=15,
+                )
+                d = resp.json()
         except Exception as e:
-            print(f"[Video-Fetch] Page {page} error: {e}")
+            print(f"[Video-Fetch:DIRECT] Page {page} error: {e}")
             break
-        if d.get("code") != 0:
-            print(f"[Video-Fetch] Page {page} API error: {d.get('message')}")
+
+        code = d.get("code", 0)
+        if code != 0:
+            print(f"[Video-Fetch:DIRECT] Page {page} error ({code}): {d.get('message', '')}")
+            if code == -352:
+                consecutive_352 += 1
+                if consecutive_352 >= 5: break
+                _time.sleep(min(consecutive_352 * 3, 30))
+                continue
             break
+        consecutive_352 = 0
 
         replies = d.get("data", {}).get("replies", [])
         cur = d.get("data", {}).get("cursor", {})
@@ -2161,30 +2453,20 @@ def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500) -> list:
         cursor = cur.get("next", 0)
 
         for r in replies:
-            if len(all_items) >= max_count:
-                break
+            if len(all_items) >= max_count: break
             m = r.get("member", {})
-            content_obj = r.get("content", {})
-            message = content_obj.get("message", "")
-            item = {
+            cobj = r.get("content", {})
+            all_items.append({
                 "rpid": r["rpid"], "parent_rpid": 0, "root_rpid": 0,
                 "uid": m.get("mid", 0), "user": m.get("uname", ""),
-                "content": message[:500], "like_count": r.get("like", 0),
-                "reply_count": r.get("rcount", 0),
+                "content": cobj.get("message", "")[:500],
+                "like_count": r.get("like", 0), "reply_count": r.get("rcount", 0),
                 "ctime": r.get("ctime", 0),
                 "sort_mode": "hot" if mode == 3 else "time",
                 "matched_keywords": [],
-            }
-            all_items.append(item)
+            })
 
-            # Fetch sub-replies for this main comment if any
-            rcount = r.get("rcount", 0)
-            if rcount > 0:
-                sub_replies = _bili_fetch_sub_replies(aid, r["rpid"], max_count - len(all_items))
-                all_items.extend(sub_replies)
-
-        if is_end or not cursor:
-            break
+        if is_end or not cursor: break
         _time.sleep(0.4)
 
     return all_items
@@ -3276,3 +3558,891 @@ async def reorder_identity_queue(body: dict):
         return {"ok": True, "message": "顺序已更新"}
     finally:
         db.close()
+
+
+# ==================== Opinion Timeline (舆情推演) ====================
+
+_ot_state: dict = {"task_id": None, "status": "idle", "progress": ""}
+_ot_lock = threading.Lock()
+
+
+def _ot_run_fetch(task_id: str, bvid: str, aid: int):
+    """Background: fetch ALL comments by time order (mode=2) for timeline analysis."""
+    global _ot_state
+    db = SessionLocal()
+    try:
+        _ot_state["progress"] = "正在全量拉取时间排序评论..."
+        comments = _bili_fetch_comments(aid, mode=2, max_count=99999)  # fetch all
+        print(f"[OT-Fetch] Time sort: {len(comments)} items")
+
+        _ot_state["progress"] = f"已获取{len(comments)}条评论，正在保存..."
+
+        # Save comments to a temporary JSON for analysis (no DB comments table needed)
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if task:
+            task.status = "fetched"
+            task.total_comments = len(comments)
+            if comments:
+                task.time_start = min(c["ctime"] for c in comments)
+                task.time_end = max(c["ctime"] for c in comments)
+            task.updated_at = datetime.utcnow()
+
+            # Store raw comments as JSON on task for analysis phase
+            # Use a compact temp storage
+            import tempfile, os as _os
+            tmpdir = _os.path.join(_os.path.dirname(__file__), "..", "data")
+            _os.makedirs(tmpdir, exist_ok=True)
+            tmpfile = _os.path.join(tmpdir, f"_ot_comments_{task_id}.json")
+            with open(tmpfile, "w", encoding="utf-8") as f:
+                json.dump(comments, f, ensure_ascii=False)
+
+        db.commit()
+
+        _ot_state = {"task_id": task_id, "status": "fetched",
+                     "progress": f"完成! 共{len(comments)}条评论, 等待分析"}
+
+    except Exception as e:
+        print(f"[OT-Fetch] ERROR: {e}")
+        import traceback as _tb; _tb.print_exc()
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if task:
+            task.status = "error"; task.error_msg = str(e)[:300]; task.updated_at = datetime.utcnow()
+            db.commit()
+        _ot_state = {"task_id": task_id, "status": "error", "progress": f"错误: {str(e)[:100]}"}
+    finally:
+        db.close()
+
+
+def _ot_run_analyze(task_id: str):
+    """Background: DeepSeek analyze all comments, build heatmap grid + centroid trail."""
+    global _ot_state
+    api_key = _get_deepseek_key()
+    import time as _time, os as _os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    db = SessionLocal()
+    try:
+        # Load comments from temp file
+        tmpdir = _os.path.join(_os.path.dirname(__file__), "..", "data")
+        tmpfile = _os.path.join(tmpdir, f"_ot_comments_{task_id}.json")
+        with open(tmpfile, "r", encoding="utf-8") as f:
+            comments = json.load(f)
+
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if not task:
+            return
+
+        # Analyze each comment for (x, y) coordinates
+        _ot_state["progress"] = f"正在AI分析{len(comments)}条评论坐标..."
+
+        results: list[dict] = []  # [{content, ctime, x, y}, ...]
+
+        def analyze_one(c):
+            content = c.get("content", "")
+            x, y = _deepseek_score_comment(content, api_key)
+            return {"content": content[:100], "ctime": c["ctime"], "x": x, "y": y}
+
+        executor = ThreadPoolExecutor(max_workers=100)
+        futures = {executor.submit(analyze_one, c): c for c in comments}
+        done = 0; total = len(comments); succeeded = 0
+
+        for future in as_completed(futures):
+            try:
+                r = future.result(timeout=30)
+                if r["x"] >= 0 and r["y"] >= 0:
+                    results.append(r)
+                    succeeded += 1
+            except Exception:
+                pass
+            done += 1
+            if done % 20 == 0 or done == total:
+                _ot_state["progress"] = f"分析进度: {done}/{total} (成功{succeeded})"
+
+        executor.shutdown(wait=False)
+
+        if not results:
+            task.status = "error"; task.error_msg = "所有评论分析失败"
+            db.commit()
+            _ot_state = {"task_id": task_id, "status": "error", "progress": "分析失败: 无有效结果"}
+            return
+
+        # Build 101x101 heatmap grid
+        GRID_SIZE = 101
+        grid = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+        for r in results:
+            gx = max(0, min(100, int(round(r["x"]))))
+            gy = max(0, min(100, int(round(r["y"]))))
+            grid[gx][gy] += 1
+
+        # Calculate final centroid (weighted by count at each coordinate)
+        total_w = sum(r for row in grid for r in row)
+        sum_wx = sum(x * grid[x][y] for x in range(GRID_SIZE) for y in range(GRID_SIZE))
+        sum_wy = sum(y * grid[x][y] for x in range(GRID_SIZE) for y in range(GRID_SIZE))
+        centroid_x = round(sum_wx / total_w, 2) if total_w > 0 else 50.0
+        centroid_y = round(sum_wy / total_w, 2) if total_w > 0 else 50.0
+
+        # Calculate centroid trail: split into 50 time buckets
+        TRAIL_BUCKETS = 50
+        sorted_results = sorted(results, key=lambda r: r["ctime"])
+        if not sorted_results:
+            trail = []
+        else:
+            t_min = sorted_results[0]["ctime"]
+            t_max = sorted_results[-1]["ctime"]
+            t_range = max(t_max - t_min, 1)
+
+            trail = []
+            for bi in range(TRAIL_BUCKETS):
+                t_start = t_min + (t_range * bi / TRAIL_BUCKETS)
+                t_end = t_min + (t_range * (bi + 1) / TRAIL_BUCKETS)
+                bucket = [r for r in sorted_results if t_start <= r["ctime"] <= t_end]
+                if not bucket:
+                    continue
+                # Count per coordinate in bucket
+                bcounts = {}
+                for r in bucket:
+                    gx = max(0, min(100, int(round(r["x"]))))
+                    gy = max(0, min(100, int(round(r["y"]))))
+                    key = (gx, gy)
+                    bcounts[key] = (bcounts.get(key, (0, 0))[0] + 1, 0)
+                bw = sum(c for (c, _) in bcounts.values())
+                bwx = sum(k[0] * c for k, (c, _) in bcounts.items())
+                bwy = sum(k[1] * c for k, (c, _) in bcounts.items())
+                if bw > 0:
+                    # Format time as readable string
+                    from datetime import datetime as _dt
+                    t_mid = (t_start + t_end) / 2
+                    t_label = _dt.fromtimestamp(t_mid).strftime("%m-%d %H:%M")
+                    trail.append({
+                        "x": round(bwx / bw, 2),
+                        "y": round(bwy / bw, 2),
+                        "t": t_label,
+                        "count": len(bucket),
+                    })
+
+        # Save results
+        task.status = "done"
+        task.analyzed_count = succeeded
+        task.heatmap_grid = grid
+        task.centroid_trail = trail
+        task.centroid_x = centroid_x
+        task.centroid_y = centroid_y
+        task.comments_data = results  # persist coordinate data for clustering
+        task.updated_at = datetime.utcnow()
+        db.commit()
+
+        # Clean up temp file
+        try: _os.remove(tmpfile)
+        except: pass
+
+        _ot_state = {"task_id": task_id, "status": "done",
+                     "progress": f"分析完成! 成功{succeeded}/{total}条, 轨迹{len(trail)}段"}
+
+    except Exception as e:
+        print(f"[OT-Analyze] ERROR: {e}")
+        import traceback as _tb; _tb.print_exc()
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if task:
+            task.status = "error"; task.error_msg = str(e)[:300]
+            db.commit()
+        _ot_state = {"task_id": task_id, "status": "error", "progress": f"错误: {str(e)[:100]}"}
+    finally:
+        db.close()
+
+
+def _ot_task_to_dict(t: OpinionTimelineTask) -> dict:
+    return {
+        "id": t.id, "bvid": t.bvid, "aid": t.aid, "title": t.title,
+        "coverUrl": t.cover_url, "url": t.url,
+        "status": t.status, "errorMsg": t.error_msg,
+        "totalComments": t.total_comments, "analyzedCount": t.analyzed_count,
+        "centroidX": t.centroid_x, "centroidY": t.centroid_y,
+        "timeStart": t.time_start, "timeEnd": t.time_end,
+        "createdAt": t.created_at.isoformat() if t.created_at else "",
+        "updatedAt": t.updated_at.isoformat() if t.updated_at else "",
+    }
+
+
+@router.post("/opinion-timeline/fetch")
+async def ot_fetch(body: dict):
+    """Start fetching all comments by time for a video URL."""
+    url = body.get("url", "")
+    if not url:
+        raise HTTPException(status_code=400, detail="缺少视频地址")
+
+    global _ot_state
+    import uuid, re
+
+    # Extract BV number
+    bv_match = re.search(r'(BV[a-zA-Z0-9]+)', url)
+    bvid = bv_match.group(1) if bv_match else ""
+
+    # Get aid from bvid
+    aid, title, cover, info_err = _bili_get_aid(bvid)
+    if info_err:
+        raise HTTPException(status_code=400, detail=f"获取视频信息失败: {info_err}")
+
+    task_id = uuid.uuid4().hex[:16]
+
+    db = SessionLocal()
+    try:
+        task = OpinionTimelineTask(
+            id=task_id, bvid=bvid, aid=aid,
+            title=title, cover_url=cover, url=url,
+            status="fetching",
+            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+        )
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+    _ot_state = {"task_id": task_id, "status": "fetching", "progress": "开始拉取评论..."}
+    threading.Thread(target=_ot_run_fetch, args=(task_id, bvid, aid), daemon=True).start()
+
+    return {"ok": True, "taskId": task_id, "bvid": bvid, "message": "开始全量拉取评论"}
+
+
+@router.get("/opinion-timeline/status")
+async def ot_status():
+    return _ot_state
+
+
+@router.post("/opinion-timeline/analyze")
+async def ot_analyze(body: dict):
+    """Start DeepSeek coordinate analysis for a fetched task."""
+    task_id = body.get("taskId", "")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="缺少taskId")
+
+    global _ot_state
+    db = SessionLocal()
+    try:
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if task.status != "fetched":
+            raise HTTPException(status_code=400, detail=f"任务状态异常: {task.status}")
+        task.status = "analyzing"
+        task.updated_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+    _ot_state = {"task_id": task_id, "status": "analyzing", "progress": "开始AI坐标分析..."}
+    threading.Thread(target=_ot_run_analyze, args=(task_id,), daemon=True).start()
+
+    return {"ok": True, "taskId": task_id, "message": "开始分析"}
+
+
+@router.get("/opinion-timeline/result/{task_id}")
+async def ot_result(task_id: str):
+    """Get the analysis result: heatmap grid + centroid trail + task info."""
+    db = SessionLocal()
+    try:
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return {
+            "task": _ot_task_to_dict(task),
+            "heatmapGrid": task.heatmap_grid,
+            "centroidTrail": task.centroid_trail or [],
+        }
+    finally:
+        db.close()
+
+
+@router.get("/opinion-timeline/tasks")
+async def ot_list_tasks():
+    """List all opinion timeline tasks (non-saved)."""
+    db = SessionLocal()
+    try:
+        tasks = db.query(OpinionTimelineTask).order_by(OpinionTimelineTask.created_at.desc()).all()
+        return {"items": [_ot_task_to_dict(t) for t in tasks], "total": len(tasks)}
+    finally:
+        db.close()
+
+
+@router.delete("/opinion-timeline/task/{task_id}")
+async def ot_delete_task(task_id: str):
+    """Delete an opinion timeline task."""
+    db = SessionLocal()
+    try:
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if task:
+            db.delete(task)
+            db.commit()
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+@router.post("/opinion-timeline/saved")
+async def ot_save(body: dict):
+    """Save a completed analysis result."""
+    task_id = body.get("taskId", "")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="缺少taskId")
+
+    db = SessionLocal()
+    try:
+        task = db.query(OpinionTimelineTask).filter(OpinionTimelineTask.id == task_id).first()
+        if not task or task.status != "done":
+            raise HTTPException(status_code=400, detail="任务未完成或不存在")
+
+        saved = SavedOpinionTimelineTask(
+            source_task_id=task.id, bvid=task.bvid, title=task.title, cover_url=task.cover_url,
+            total_comments=task.total_comments, analyzed_count=task.analyzed_count,
+            heatmap_grid=task.heatmap_grid, centroid_trail=task.centroid_trail,
+            centroid_x=task.centroid_x, centroid_y=task.centroid_y,
+            time_start=task.time_start, time_end=task.time_end,
+            node_indices=body.get("nodeIndices"),
+            comments_data=task.comments_data,
+            saved_at=datetime.utcnow(),
+        )
+        db.add(saved)
+        db.commit()
+        return {"ok": True, "id": saved.id, "message": "已保存"}
+    finally:
+        db.close()
+
+
+@router.get("/opinion-timeline/saved")
+async def ot_list_saved():
+    """List all saved opinion timeline tasks."""
+    db = SessionLocal()
+    try:
+        items = db.query(SavedOpinionTimelineTask).order_by(SavedOpinionTimelineTask.saved_at.desc()).all()
+        return {
+            "items": [{
+                "id": s.id, "sourceTaskId": s.source_task_id, "bvid": s.bvid,
+                "title": s.title, "coverUrl": s.cover_url,
+                "totalComments": s.total_comments, "analyzedCount": s.analyzed_count,
+                "centroidX": s.centroid_x, "centroidY": s.centroid_y,
+                "timeStart": s.time_start, "timeEnd": s.time_end,
+                "nodeIndices": s.node_indices,
+                "savedAt": s.saved_at.isoformat(),
+            } for s in items],
+            "total": len(items),
+        }
+    finally:
+        db.close()
+
+
+@router.get("/opinion-timeline/saved/{saved_id}")
+async def ot_get_saved(saved_id: int):
+    """Get a saved result with full heatmap grid and centroid trail."""
+    db = SessionLocal()
+    try:
+        s = db.query(SavedOpinionTimelineTask).filter(SavedOpinionTimelineTask.id == saved_id).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="不存在")
+        return {
+            "task": {
+                "id": s.source_task_id, "bvid": s.bvid, "title": s.title, "coverUrl": s.cover_url,
+                "totalComments": s.total_comments, "analyzedCount": s.analyzed_count,
+                "centroidX": s.centroid_x, "centroidY": s.centroid_y,
+                "timeStart": s.time_start, "timeEnd": s.time_end,
+                "nodeIndices": s.node_indices,
+                "savedAt": s.saved_at.isoformat(),
+            },
+            "heatmapGrid": s.heatmap_grid,
+            "centroidTrail": s.centroid_trail or [],
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/opinion-timeline/saved/{saved_id}")
+async def ot_delete_saved(saved_id: int):
+    """Delete a saved opinion timeline result."""
+    db = SessionLocal()
+    try:
+        s = db.query(SavedOpinionTimelineTask).filter(SavedOpinionTimelineTask.id == saved_id).first()
+        if s:
+            db.delete(s); db.commit()
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+@router.post("/opinion-timeline/saved/{saved_id}/nodes")
+async def ot_save_nodes(saved_id: int, body: dict):
+    """Save user-marked landmark nodes for a saved timeline result."""
+    node_indices = body.get("nodeIndices", [])
+    db = SessionLocal()
+    try:
+        s = db.query(SavedOpinionTimelineTask).filter(SavedOpinionTimelineTask.id == saved_id).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        s.node_indices = node_indices
+        db.commit()
+        return {"ok": True, "message": f"已保存 {len(node_indices)} 个节点"}
+    finally:
+        db.close()
+
+
+# ======================================================================
+#  Cluster Analysis API (聚类分群)
+# ======================================================================
+
+# --- Weighted agglomerative clustering ---
+
+def _cluster_points(points: list, weight_key: str = "w", dist_threshold: float = 15.0) -> list:
+    """Cluster weighted 2D points using agglomerative merging.
+    points: [{x, y, w: count, content, ctime, ...}, ...]
+    Returns list of clusters, each: {centroid: {x,y}, members: [...], totalWeight: int}
+    """
+    import math
+
+    n = len(points)
+    if n == 0:
+        return []
+
+    # Each point starts as its own cluster
+    clusters = [{
+        "id": i,
+        "centroid": {"x": p["x"], "y": p["y"]},
+        "members": [p],
+        "totalWeight": p.get(weight_key, 1),
+    } for i, p in enumerate(points)]
+
+    total_weight = sum(c["totalWeight"] for c in clusters)
+
+    # Precompute pairwise distances
+    def _dist(ci, cj):
+        dx = ci["centroid"]["x"] - cj["centroid"]["x"]
+        dy = ci["centroid"]["y"] - cj["centroid"]["y"]
+        return math.sqrt(dx * dx + dy * dy)
+
+    merged = True
+    while merged and len(clusters) > 2:
+        merged = False
+        best_d = dist_threshold + 1
+        best_i, best_j = -1, -1
+
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                d = _dist(clusters[i], clusters[j])
+                if d < best_d:
+                    best_d, best_i, best_j = d, i, j
+
+        if best_i >= 0 and best_d <= dist_threshold:
+            ci, cj = clusters[best_i], clusters[best_j]
+            w1, w2 = ci["totalWeight"], cj["totalWeight"]
+            tw = w1 + w2
+            cx = (ci["centroid"]["x"] * w1 + cj["centroid"]["x"] * w2) / tw
+            cy = (ci["centroid"]["y"] * w1 + cj["centroid"]["y"] * w2) / tw
+            new_cluster = {
+                "id": ci["id"],
+                "centroid": {"x": round(cx, 2), "y": round(cy, 2)},
+                "members": ci["members"] + cj["members"],
+                "totalWeight": tw,
+            }
+            clusters.pop(best_j)
+            clusters.pop(best_i)
+            clusters.append(new_cluster)
+            merged = True
+
+    # Filter clusters below 5% of total
+    min_weight = total_weight * 0.05
+    clusters = [c for c in clusters if c["totalWeight"] >= min_weight]
+
+    # Re-number cluster IDs
+    for i, c in enumerate(clusters):
+        c["id"] = i
+
+    return clusters
+
+
+def _compute_concave_hull(members: list, grid_step: int = 2) -> list:
+    """Compute a simple rectangular bounding envelope for cluster members.
+    Returns list of [x,y] corner points forming a polygon."""
+    if not members:
+        return []
+    xs = [m["x"] for m in members]
+    ys = [m["y"] for m in members]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    # Pad by 3 units
+    pad = 3
+    min_x = max(0, min_x - pad)
+    max_x = min(100, max_x + pad)
+    min_y = max(0, min_y - pad)
+    max_y = min(100, max_y + pad)
+    return [[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]]
+
+
+def _run_cluster_deepseek(cluster: dict) -> dict:
+    """Call DeepSeek API to analyze a cluster.
+    Returns {definition, coreClaim, arguments: [], materialBasis}"""
+    import httpx
+
+    members = cluster["members"]
+    if len(members) > 50:
+        # Sample for prompt
+        import random
+        members = random.sample(members, 50)
+
+    samples = "\n".join(f"- [{m.get('x','?')},{m.get('y','?')}] {m.get('content','')[:100]}"
+                         for m in members[:50])
+
+    centroid_x = cluster["centroid"]["x"]
+    centroid_y = cluster["centroid"]["y"]
+    attitude = "支持" if centroid_x > 55 else ("反对" if centroid_x < 45 else "中立")
+    style = "感性" if centroid_y > 55 else ("理性" if centroid_y < 45 else "中性")
+
+    prompt = f"""你是舆情分析师。以下是一组B站用户评论，他们在二维坐标上的质心在 ({centroid_x:.0f}, {centroid_y:.0f})：
+X轴：0=反对米哈游，100=支持米哈游
+Y轴：0=理性客观，100=感性情绪化
+
+该群体大致态度：{attitude}米哈游，表达风格：{style}
+
+评论样本（坐标x,y和内容）：
+{samples}
+
+请用JSON格式返回（不要其他文字）：
+{{
+  "definition": "因XX【原因】而【{style}】【{attitude}】米哈游的群体。人数：【{cluster['totalWeight']}】。",
+  "coreClaim": "该群体的核心主张，一句话概括（15字以内）",
+  "arguments": ["支撑论据1", "支撑论据2", "支撑论据3"],
+  "materialBasis": "该群体的物质基础或现实现状（20字以内），如：大学生/上班族/二游老玩家"
+}}"""
+
+    api_key = _get_deepseek_key()
+    if not api_key:
+        # Fallback: generate basic definition without AI
+        return {
+            "definition": f"质心({centroid_x:.0f},{centroid_y:.0f})的{attitude}米哈游{style}群体。人数：【{cluster['totalWeight']}】。",
+            "coreClaim": f"对米哈游持{attitude}态度",
+            "arguments": ["数据聚类分析结果", "基于坐标聚合", "需要DeepSeek API获取详细分析"],
+            "materialBasis": "未配置API密钥",
+        }
+
+    try:
+        resp = httpx.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 600,
+            },
+            timeout=60,
+        )
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        # Extract JSON from response
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+            if content.endswith("```"):
+                content = content[:-3]
+        return json.loads(content)
+    except Exception as e:
+        print(f"[Cluster-DS] Error: {e}")
+        return {
+            "definition": f"质心({centroid_x:.0f},{centroid_y:.0f})的群体。人数：【{cluster['totalWeight']}】。（分析失败）",
+            "coreClaim": "分析失败",
+            "arguments": [str(e)[:100], "", ""],
+            "materialBasis": "未知",
+        }
+
+
+def _get_deepseek_key() -> str:
+    """Read DeepSeek API key from config or DB."""
+    import os
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if env_key:
+        return env_key
+    try:
+        db = SessionLocal()
+        acc = db.query(AccountModel).filter(AccountModel.platform == "deepseek").first()
+        if acc and acc.is_valid:
+            return acc.username
+    except:
+        pass
+    finally:
+        if "db" in locals():
+            db.close()
+    return ""
+
+
+# --- Endpoints ---
+
+@router.post("/cluster/analyze")
+async def cluster_analyze(body: dict):
+    """Run weighted clustering + DeepSeek analysis on a saved timeline result."""
+    saved_id = body.get("savedId")
+    if not saved_id:
+        raise HTTPException(status_code=400, detail="缺少savedId")
+
+    db = SessionLocal()
+    try:
+        saved = db.query(SavedOpinionTimelineTask).filter(
+            SavedOpinionTimelineTask.id == saved_id
+        ).first()
+        if not saved:
+            raise HTTPException(status_code=404, detail="保存记录不存在")
+
+        # Expand grid: each cell with count creates "count" data points (but limited for performance)
+        # Alternative: use weighted clustering where each cell is a point with weight=count
+        # Actually, comments_data already has individual points: [{content, ctime, x, y}, ...]
+        comments = saved.comments_data
+        if not comments:
+            # Fallback: expand from heatmap grid
+            if not saved.heatmap_grid:
+                raise HTTPException(status_code=400, detail="无数据")
+
+            grid = saved.heatmap_grid
+            comments = []
+            for gx in range(101):
+                for gy in range(101):
+                    cnt = grid[gx][gy] if gx < len(grid) and gy < len(grid[gx]) else 0
+                    if cnt > 0:
+                        comments.append({"x": gx, "y": gy, "w": cnt, "content": f"({gx},{gy})"})
+
+        # If using grid expansion, points already have "w" key
+        # If individual comments, add w=1
+        weighted = []
+        for c in comments:
+            wc = dict(c)
+            if "w" not in wc:
+                wc["w"] = 1
+            weighted.append(wc)
+
+        # Run clustering
+        clusters = _cluster_points(weighted, dist_threshold=18.0)
+
+        # Compute boundaries and run DeepSeek for each cluster
+        cluster_results = []
+        for c in clusters:
+            bbox = _compute_concave_hull(c["members"])
+            pct = round(c["totalWeight"] / saved.total_comments * 100, 1) if saved.total_comments else 0
+
+            cluster_obj = {
+                "id": c["id"],
+                "centroid": c["centroid"],
+                "memberCount": c["totalWeight"],
+                "percentage": pct,
+                "boundary": bbox,
+                "deepseek": None,
+            }
+
+            # Run DeepSeek analysis
+            try:
+                cluster_obj["deepseek"] = _run_cluster_deepseek(c)
+            except Exception as e:
+                print(f"[Cluster] DeepSeek failed for cluster {c['id']}: {e}")
+                cluster_obj["deepseek"] = {
+                    "definition": f"聚类{c['id']}。人数：【{c['totalWeight']}】。",
+                    "coreClaim": "分析未完成",
+                    "arguments": [str(e)[:100], "", ""],
+                    "materialBasis": "未知",
+                }
+
+            cluster_results.append(cluster_obj)
+
+        # Save to DB
+        ca = ClusterAnalysis(
+            saved_timeline_id=saved_id,
+            bvid=saved.bvid,
+            title=saved.title,
+            total_comments=saved.total_comments,
+            cluster_count=len(cluster_results),
+            clusters=cluster_results,
+            created_at=datetime.utcnow(),
+        )
+        db.add(ca)
+        db.commit()
+        db.refresh(ca)
+
+        return {
+            "ok": True,
+            "id": ca.id,
+            "clusterCount": len(cluster_results),
+            "clusters": cluster_results,
+        }
+    finally:
+        db.close()
+
+
+@router.get("/cluster/result/{analysis_id}")
+async def cluster_get(analysis_id: int):
+    """Get a cluster analysis result."""
+    db = SessionLocal()
+    try:
+        ca = db.query(ClusterAnalysis).filter(ClusterAnalysis.id == analysis_id).first()
+        if not ca:
+            raise HTTPException(status_code=404, detail="不存在")
+        return {
+            "id": ca.id,
+            "savedTimelineId": ca.saved_timeline_id,
+            "bvid": ca.bvid,
+            "title": ca.title,
+            "totalComments": ca.total_comments,
+            "clusterCount": ca.cluster_count,
+            "clusters": ca.clusters or [],
+            "createdAt": ca.created_at.isoformat() if ca.created_at else "",
+        }
+    finally:
+        db.close()
+
+
+@router.get("/cluster/by-saved/{saved_id}")
+async def cluster_by_saved(saved_id: int):
+    """Get the latest cluster analysis for a saved timeline result."""
+    db = SessionLocal()
+    try:
+        ca = db.query(ClusterAnalysis).filter(
+            ClusterAnalysis.saved_timeline_id == saved_id
+        ).order_by(ClusterAnalysis.created_at.desc()).first()
+        if not ca:
+            return {"id": None, "clusters": []}
+        return {
+            "id": ca.id,
+            "savedTimelineId": ca.saved_timeline_id,
+            "bvid": ca.bvid,
+            "title": ca.title,
+            "totalComments": ca.total_comments,
+            "clusterCount": ca.cluster_count,
+            "clusters": ca.clusters or [],
+            "createdAt": ca.created_at.isoformat() if ca.created_at else "",
+        }
+    finally:
+        db.close()
+
+
+@router.get("/cluster/list")
+async def cluster_list():
+    """List all cluster analyses."""
+    db = SessionLocal()
+    try:
+        items = db.query(ClusterAnalysis).order_by(ClusterAnalysis.created_at.desc()).all()
+        return {
+            "items": [{
+                "id": ca.id,
+                "bvid": ca.bvid,
+                "title": ca.title,
+                "totalComments": ca.total_comments,
+                "clusterCount": ca.cluster_count,
+                "createdAt": ca.created_at.isoformat() if ca.created_at else "",
+            } for ca in items],
+            "total": len(items),
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/cluster/{analysis_id}")
+async def cluster_delete(analysis_id: int):
+    """Delete a cluster analysis."""
+    db = SessionLocal()
+    try:
+        ca = db.query(ClusterAnalysis).filter(ClusterAnalysis.id == analysis_id).first()
+        if ca:
+            db.delete(ca)
+            db.commit()
+        return {"ok": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+# ======================================================================
+#  PDF Report Generator
+# ======================================================================
+
+import uuid as _uuid
+import threading as _threading
+
+_pdf_jobs: dict = {}  # job_id → {status, step, total, message, error, result_buf}
+
+@router.post("/pdf-report/generate")
+async def pdf_report_generate(body: dict):
+    """Start PDF generation job. Returns job_id for progress polling."""
+    from app.pdf_report import generate_pdf, MODULE_LABELS
+
+    saved_id = body.get("savedId")
+    modules = body.get("modules", [])
+
+    if not saved_id:
+        raise HTTPException(status_code=400, detail="缺少savedId")
+    if not modules:
+        raise HTTPException(status_code=400, detail="请至少选择一个模块")
+
+    valid = [m for m in modules if m in MODULE_LABELS]
+    if not valid:
+        raise HTTPException(status_code=400, detail="无效的模块选择")
+
+    job_id = _uuid.uuid4().hex[:12]
+    _pdf_jobs[job_id] = {"status": "running", "step": 0, "total": len(valid) + 3,
+                          "message": "正在初始化...", "error": None, "result_buf": None}
+
+    ds_key = _get_deepseek_key()
+
+    def _run():
+        db = SessionLocal()
+        try:
+            def _cb(step, total, msg):
+                _pdf_jobs[job_id] = {**_pdf_jobs[job_id],
+                    "step": step, "total": total, "message": msg}
+
+            pdf_buf = generate_pdf(saved_id, valid, db, ds_api_key=ds_key or None,
+                                    progress_cb=_cb)
+            _pdf_jobs[job_id] = {**_pdf_jobs[job_id], "status": "done",
+                "result_buf": pdf_buf, "message": "生成完成，正在下载..."}
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _pdf_jobs[job_id] = {**_pdf_jobs[job_id], "status": "error",
+                "error": str(e), "message": f"错误: {str(e)[:200]}"}
+        finally:
+            db.close()
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "jobId": job_id}
+
+
+@router.get("/pdf-report/progress/{job_id}")
+async def pdf_report_progress(job_id: str):
+    """Poll PDF generation progress."""
+    job = _pdf_jobs.get(job_id)
+    if not job:
+        return {"status": "not_found"}
+    return {
+        "status": job["status"],
+        "step": job["step"],
+        "total": job["total"],
+        "message": job["message"],
+        "error": job.get("error"),
+    }
+
+
+@router.get("/pdf-report/download/{job_id}")
+async def pdf_report_download(job_id: str):
+    """Download completed PDF by job ID."""
+    from fastapi.responses import Response
+    job = _pdf_jobs.get(job_id)
+    if not job or job["status"] != "done":
+        raise HTTPException(status_code=404, detail="PDF未就绪")
+    buf = job.pop("result_buf", None)
+    if not buf:
+        raise HTTPException(status_code=404, detail="PDF已过期")
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=miho_spot_report_{job_id}.pdf"}
+    )
+
+
+@router.get("/pdf-report/modules")
+async def pdf_report_modules():
+    """List available PDF report modules with labels and descriptions."""
+    from app.pdf_report import MODULE_LABELS
+    return {
+        "modules": [
+            {"key": k, "label": v[0], "description": v[1]}
+            for k, v in MODULE_LABELS.items()
+        ]
+    }

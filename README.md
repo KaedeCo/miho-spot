@@ -2,7 +2,7 @@
 
 > "从此以后，每个人都是社管，亦或者都不是社管。" — By Chronostasis
 
-**v1.3**
+**v1.4**
 
 Miho-spot 是一个多平台二游圈舆情监测与分析系统，覆盖知乎、抖音、贴吧、B站等平台。通过热搜爬取、关键词匹配、SnowNLP 本地情感分析、DeepSeek AI 增强分析，实时追踪米哈游相关舆论风向。
 
@@ -238,6 +238,26 @@ flowchart TD
 - **视觉设计** — SVG 原生绘制，深空主题配色（#0a0a20 背景），中心十字线高亮，边缘径向渐变淡化效果，缩放滑块 50%–250%
 - **技术实现** — 纯前端 SVG 渲染（无依赖第三方图表库），坐标映射函数 `tx()`/`ty()` 实现数值→像素转换
 
+### 舆情推演（v1.4 新增，`/opinion-timeline`）
+- **全量评论拉取** — 输入B站视频链接，拉取全部时间序评论
+- **二维热力图** — 101×101 密度矩阵，三角形标记 + 不规则光晕 + 等高虚线
+- **质心漂移轨迹** — 时间分桶加权质心，金色虚线轨迹带黑色边框，时间轴滑块可拖动
+- **用户节点标记** — 右键点击进度条标记关键时间节点，显示为五角星，节点持久化存储
+- **帮助提示** — 图标图例悬停弹窗，说明三角/星/圆点/虚线等含义
+
+### 聚类分群（v1.4 新增，`/cluster-analysis`）
+- **加权凝聚聚类** — 自动将评论群体划分，过滤<5%噪声小群
+- **DeepSeek 群体画像** — 关键词定义 + 核心主张 + 三大论据 + 物质基础
+- **蓝色虚线框** — 每个群体的二维坐标边界可视化，悬停定义气泡，点击详情面板
+- **复用热力图渲染** — 与舆情推演共享 Canvas 2D 渲染代码
+
+### PDF报告定制（v1.4 新增，侧边栏 + 深度分析页面内）
+- **九大模块自由勾选** — 事件总览/热力图/阵营/轨迹/聚类/对立面/词云/用户图谱/AI研判
+- **学位论文格式** — A4 标准边距 / 三号章标题 / 小四号正文 1.5倍行距 / 封面+摘要+目录+参考文献
+- **离线优先** — 8 个模块本地渲染，仅 AI 研判需 API
+- **渐进式降级** — 图片溢出→纯文字模式，单模块失败不影响全局
+- **常驻进度条** — 分步进度 + 百分比 + 报错信息
+
 ### 数据可视化
 - **仪表盘** — 6 个统计卡片 + 情感分布饼图/柱状图 + 平台分布图
 - **历史统计** — 支持 7 天 / 30 天 / 自定义时间范围，面积图 + 折线图趋势展示
@@ -273,6 +293,12 @@ flowchart TD
 | curl_cffi | 绕过 Cloudflare 防护 |
 | DeepSeek API | AI 增强分析 |
 | AICU API | B站用户历史评论数据源 |
+| reportlab | [v1.4] PDF 报告生成引擎 |
+| matplotlib | [v1.4] 二维图表渲染 |
+| wordcloud | [v1.4] 词云图片生成 |
+| Three.js | [v1.3] 3D 热力图渲染 |
+| IDW 插值 | [v1.3] 反距离加权空间插值 |
+| 凝聚聚类 | [v1.4] 加权层次聚类算法 |
 
 ---
 
@@ -323,7 +349,9 @@ miho-spot/
 │       │   ├── Spectrum2D.tsx    # [v1.2] 二维光谱图（散点坐标系）
 │       │   ├── VideoAnalysis.tsx # [v1.3] 视频分析（评论挖掘+KOL排行）
 │       │   ├── WordCloud.tsx     # [v1.3] 词云生成器
-│       │   └── DeepAnalysis.tsx  # [v1.3] 深度分析（话题探索）
+│       │   ├── DeepAnalysis.tsx  # [v1.3] 深度分析（话题探索）
+│       │   ├── OpinionTimeline.tsx # [v1.4] 舆情推演（时间序列+二维热力图）
+│       │   └── ClusterAnalysis.tsx # [v1.4] 聚类分群（加权聚类+群体画像）
 │       ├── services/api.ts       # API 调用层
 │       └── types/index.ts        # TypeScript 类型定义
 ├── backend/                      # Python 后端
@@ -333,7 +361,8 @@ miho-spot/
 │       ├── bilibili/__init__.py  # [v1.1] B站评论拉取 + DeepSeek 分析
 │       ├── crawlers/__init__.py  # 爬虫引擎（知乎/抖音/贴吧/Tophub）
 │       ├── sentiment/__init__.py # 情感分析（关键词匹配 + SnowNLP）
-│       ├── models/__init__.py    # SQLAlchemy 模型
+│       ├── models/__init__.py    # SQLAlchemy 模型（含自动迁移）
+│       ├── pdf_report.py         # [v1.4] PDF报告生成引擎（九大模块+论文格式）
 │       ├── monitor.py            # PyQt6 监控面板
 │       └── gui/main_window.py    # PyQt6 桌面窗口
 ├── start.bat                     # Windows 一键启动脚本
@@ -364,6 +393,17 @@ miho-spot/
 | `/api/video-analysis/kol-top` | GET | KOL 影响力 Top 10 排行 |
 | `/api/video-analysis/wordcloud` | GET | 评论高频词云数据 |
 | `/api/video-analysis/comments` | GET | 分页获取视频评论列表 |
+| `/api/opinion-timeline/fetch` | POST | [v1.4] 全量拉取时间序评论 |
+| `/api/opinion-timeline/analyze` | POST | [v1.4] AI 坐标分析 + 热力图生成 |
+| `/api/opinion-timeline/result/{id}` | GET | [v1.4] 获取推演结果（热力图+轨迹） |
+| `/api/opinion-timeline/saved` | GET/POST | [v1.4] 存储/列出已保存推演 |
+| `/api/opinion-timeline/saved/{id}/nodes` | POST | [v1.4] 保存时间节点标记 |
+| `/api/cluster/analyze` | POST | [v1.4] 加权聚类 + DeepSeek 群体画像 |
+| `/api/cluster/by-saved/{id}` | GET | [v1.4] 获取聚类分群结果 |
+| `/api/pdf-report/modules` | GET | [v1.4] 列出可选报告模块 |
+| `/api/pdf-report/generate` | POST | [v1.4] 启动 PDF 生成（返回 jobId） |
+| `/api/pdf-report/progress/{jobId}` | GET | [v1.4] 轮询生成进度 |
+| `/api/pdf-report/download/{jobId}` | GET | [v1.4] 下载完成的 PDF |
 
 ---
 
@@ -390,6 +430,85 @@ miho-spot/
 ---
 
 ## 更新日志
+
+### v1.4 (2026-06-04) — 聚类分群 + PDF报告定制 + 全链路体验升级
+
+#### 聚类分群（`/cluster-analysis`）
+
+基于舆情推演结果，通过加权凝聚聚类算法自动发现评论群体，DeepSeek AI 生成群体画像。
+
+**功能描述**：
+- **加权凝聚聚类** — 将 101×101 热力图网格中每个非零单元格作为带权数据点，计算欧氏距离，反复合并最近邻对（距离阈值 18），自动过滤占比低于 5% 的噪声小群，输出数个有统计意义的群体
+- **群体画像生成** — 每个群体取代表性评论样本（≤50条），调用 DeepSeek API 生成：一句话关键词定义（"因XX【原因】而【理性/感性】【支持/反对】米哈游的群体。人数：【YY】。"）、核心主张、三大论据、物质基础（如"大学生/上班族/二游老玩家"）
+- **前端渲染** — 蓝色虚线框围住每个群体的二维坐标边界，悬停显示关键词定义气泡（动态宽度），点击展开详情面板（核心主张 + 三大论据 + 物质基础）
+- **持久化存储** — 新增 `cluster_analyses` 表，聚类结果完整保存，重启不丢失
+
+**数据流转**：`saved_opinion_timeline_tasks.comments_data` → `_cluster_points()` 凝聚聚类 → `_run_cluster_deepseek()` 群体画像 → `cluster_analyses` 表
+
+**采用技术**：凝聚型层次聚类、矩形边界框计算、DeepSeek API 群体画像 Prompt、Canvas 2D 虚线框渲染
+
+#### PDF报告定制（侧边栏 + 深度分析页面）
+
+支持用户勾选分析模块（九选多），生成格式规范的 PDF 学位论文风格报告。
+
+**功能描述**：
+- **九大模块** — 事件总览 / 舆论地形图 / 情感阵营分布 / 质心漂移轨迹 / 群体聚类画廊 / 高赞观点与对立面 / 词云与争议词 / 评论区用户图谱 / AI综合研判摘要
+- **论文格式** — A4 页面 上30mm/下25mm/左30mm/右25mm 标准边距；二号标题 / 三号章标题 / 小四号正文 1.5 倍行距；封面页 + 摘要 + 目录 + 第一至九章 + 参考文献
+- **离线优先** — 八个模块完全本地读取数据库渲染，仅模块九（AI综合研判）和可选刷新（阵营总结/对立面解析）调用 DeepSeek API
+- **渐进式降级** — 图片渲染失败时自动切换纯文字模式；每个模块独立 try/except，单个失败不影响其他模块
+- **常驻进度条** — 生成过程每模块一步，百分比 + 步骤计数 + 报错信息实时展示
+- **异步 job 模型** — `POST /pdf-report/generate` 返回 jobId，前端每 600ms 轮询进度，完成后自动下载
+- **表格自动换行** — 所有表格单元格使用 Paragraph 对象，长文本自动折行并拉高行高
+- **Markdown 解析** — AI 摘要输出的 `**粗体**` / `*斜体*` / `### 标题` / `- 列表` 自动转换为 PDF 兼容的 HTML 标签
+
+**数据流转**：多表联合查询（`saved_opinion_timeline_tasks` + `video_comments` + `word_clouds` + `deep_analyses` + `cluster_analyses` + `bili_user_profiles`） → `generate_pdf()` 逐模块渲染 → reportlab PDF 字节流 → 浏览器触发下载
+
+**采用技术**：reportlab PDF 生成引擎、matplotlib 图表渲染、wordcloud 词云库、DeepSeek API 阵营总结、凝聚聚类算法
+
+#### 争议关键词计算（模块七增强）
+
+**功能描述**：从 `word_clouds` 提取高频关键词，在 `video_comments` 中分别统计每个词在反对阵营（x<40）和支持阵营（x>60）的出现频率，计算频率差，取差值最大的前 10 个词作为"争议关键词"。红色标注反对阵营高频词，蓝色标注支持阵营高频词。全部本地计算，不消耗 API。
+
+#### 查成分队列增强
+
+**功能描述**：
+- **评论上限选择** — 搜索栏新增下拉框：100/200/500/1000/不限，避免全量拉取（如 8674 条）触发 WAF 封禁
+- **常驻进度条** — 五个阶段进度（用户信息→评论拉取→关键词匹配→AI人格分析→完成），蓝紫渐变百分比 + 步骤计数器
+- **自动持久化** — 队列任务完成后自动调用 `saveBiliProfile()`，结果写入 `bili_user_profiles` 表，重启不丢，二维光谱图立即可见
+- **手动停止** — 队列运行中支持立即停止，正在处理的任务状态复位为"排队中"
+- **max_total 前移** — 评论条数限制前移到 `fetch_user_video_comments()` 内部，直接缩减拉取页数，选 100 条只拉 1 页（8 秒），而非先拉 2000 条再截断
+
+**采用技术**：sessionStorage 状态恢复、AICU API 分页控制、DeepSeek 人格分析轮询
+
+#### B站 Cookie 多字段配置
+
+**功能描述**：
+- **独立输入框** — SESSDATA(必填) / bili_jct(推荐) / buvid3(推荐) / DedeUserID(可选) / DedeUserID__ckMd5(可选)，五个字段各自独立
+- **详细引导** — 五步图文化获取教程（F12 → Application → Cookies → bilibili.com → 复制Value）
+- **实时验证** — 调用 B站 `/x/web-interface/nav` 接口，返回用户名、等级 Lv、大会员状态
+- **自动拼接** — 后端从 accounts 表读取后构建完整 Cookie 字符串
+
+**数据流转**：前端五个独立 Input → `buildCookieString()` 拼接 → `POST /api/accounts` → SQLite accounts 表
+
+#### 跨页任务恢复
+
+**功能描述**：用户在任何页面启动任务后切换到其他页面，再切回来时自动恢复轮询。
+
+- **实现机制** — 任务启动时将 taskId/jobId 写入 `sessionStorage`，页面挂载时检测未完成任务，自动重连轮询
+- **覆盖范围** — 视频分析（`va_active_task`）、舆情推演（`ot_active_task`）、PDF报告（`pdf_active_job` 侧栏+深度分析页），查成分天然可通过 UID 回溯
+- **技术** — 浏览器原生 sessionStorage，关闭标签页自动清，零后端改动
+
+#### 数据库自动迁移
+
+**功能描述**：新增 `_migrate_columns()` 函数，`init_db()` 时检查现有表是否缺少新列，缺则 `ALTER TABLE ADD COLUMN`，确保旧数据库兼容新代码，无需删库重建。
+
+**新增/修改的数据库列**：
+- `opinion_timeline_tasks.comments_data`：JSON，存储带坐标的评论数据（供聚类分群使用）
+- `saved_opinion_timeline_tasks.node_indices`：JSON，用户标记的时间节点索引
+- `saved_opinion_timeline_tasks.comments_data`：JSON，存档中的评论坐标数据
+- `cluster_analyses`：新表，聚类分群结果
+
+---
 
 ### v1.3 (2026-06-03) — 全栈稳定性修复与数据流完善
 

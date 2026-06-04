@@ -10,6 +10,8 @@ import Spectrum2D from "./pages/Spectrum2D";
 import VideoAnalysis from "./pages/VideoAnalysis";
 import WordCloud from "./pages/WordCloud";
 import DeepAnalysisPage from "./pages/DeepAnalysis";
+import OpinionTimeline from "./pages/OpinionTimeline";
+import ClusterAnalysis from "./pages/ClusterAnalysis";
 
 export default function App() {
   return (
@@ -23,6 +25,8 @@ export default function App() {
           <Route path="/identity" element={<CheckIdentity />} />
           <Route path="/spectrum" element={<Spectrum2D />} />
           <Route path="/video-analysis" element={<VideoAnalysis />} />
+          <Route path="/opinion-timeline" element={<OpinionTimeline />} />
+          <Route path="/cluster-analysis" element={<ClusterAnalysis />} />
           <Route path="/word-cloud" element={<WordCloud />} />
           <Route path="/deep-analysis" element={<DeepAnalysisPage />} />
           <Route path="/accounts" element={<Accounts />} />

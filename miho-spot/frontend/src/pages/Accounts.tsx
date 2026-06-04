@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Button, Input, Dialog, MessagePlugin, Space } from "tdesign-react";
+import { Button, Input, Dialog, MessagePlugin, Space, Textarea } from "tdesign-react";
 import { CheckCircleIcon, CloseCircleIcon, RefreshIcon } from "tdesign-icons-react";
-import { verifyAccount, saveAccount, verifyDeepSeek, getDeepSeekStatus } from "../services/api";
+import { verifyAccount, saveAccount, verifyDeepSeek, getDeepSeekStatus, getAccounts } from "../services/api";
 
 const API_KEY_DEFAULT = "";
 const STORAGE_KEY = "miho_accounts_v3";
@@ -37,7 +37,27 @@ export default function Accounts() {
   const [dsKey, setDsKey] = useState("");
   const [dsVerifying, setDsVerifying] = useState(false);
 
-  useEffect(() => { loadDsStatus(); }, []);
+  // Bilibili cookie states - multi-field
+  interface BiliCookieFields {
+    SESSDATA: string;
+    bili_jct: string;
+    buvid3: string;
+    DedeUserID: string;
+    DedeUserID__ckMd5: string;
+  }
+  const [biliCookie, setBiliCookie] = useState("");
+  const [biliValid, setBiliValid] = useState(false);
+  const [biliDlgVisible, setBiliDlgVisible] = useState(false);
+  const [biliFields, setBiliFields] = useState<BiliCookieFields>({
+    SESSDATA: "",
+    bili_jct: "",
+    buvid3: "",
+    DedeUserID: "",
+    DedeUserID__ckMd5: "",
+  });
+  const [biliVerifying, setBiliVerifying] = useState(false);
+
+  useEffect(() => { loadDsStatus(); loadBiliStatus(); }, []);
 
   const loadDsStatus = async () => {
     try {
@@ -84,6 +104,65 @@ export default function Accounts() {
     finally { setDsVerifying(false); }
   };
 
+  // --- Bilibili handlers ---
+  const loadBiliStatus = async () => {
+    try {
+      const accounts = await getAccounts();
+      const bili = Array.isArray(accounts) ? accounts.find((a: any) => a.platform === "bilibili") : null;
+      if (bili && bili.cookie) {
+        setBiliCookie(bili.cookie);
+        setBiliValid(bili.isValid || false);
+        // Parse existing cookie string into fields
+        const fields: BiliCookieFields = { SESSDATA: "", bili_jct: "", buvid3: "", DedeUserID: "", DedeUserID__ckMd5: "" };
+        bili.cookie.split(";").forEach((part: string) => {
+          const [key, ...valParts] = part.trim().split("=");
+          if (key && valParts.length) {
+            const v = valParts.join("=");
+            if (key in fields) (fields as any)[key] = v;
+          }
+        });
+        setBiliFields(fields);
+      }
+    } catch {}
+  };
+
+  /** Build cookie string from individual fields */
+  const buildCookieString = (f: BiliCookieFields): string => {
+    return Object.entries(f)
+      .filter(([, v]) => v.trim())
+      .map(([k, v]) => `${k}=${v.trim()}`)
+      .join("; ");
+  };
+
+  const handleBiliVerify = async () => {
+    if (!biliFields.SESSDATA.trim()) { MessagePlugin.warning("至少需要填写 SESSDATA 字段才能验证"); return; }
+    setBiliVerifying(true);
+    try {
+      const cookieStr = buildCookieString(biliFields);
+      const r = await verifyAccount("bilibili", cookieStr);
+      if (r.isValid) {
+        MessagePlugin.success(r.message || "Cookie验证通过");
+      } else {
+        MessagePlugin.warning(r.message || "Cookie无效");
+      }
+    } catch { MessagePlugin.error("后端未连接"); }
+    finally { setBiliVerifying(false); }
+  };
+
+  const handleBiliSave = async () => {
+    if (!biliFields.SESSDATA.trim()) { MessagePlugin.warning("至少需要填写 SESSDATA 字段"); return; }
+    setBiliVerifying(true);
+    try {
+      const cookieStr = buildCookieString(biliFields);
+      await saveAccount({ platform: "bilibili", username: biliFields.DedeUserID || "", cookie: cookieStr, isValid: true, lastVerified: new Date().toISOString() });
+      setBiliCookie(cookieStr);
+      setBiliValid(true);
+      setBiliDlgVisible(false);
+      MessagePlugin.success("B站Cookie已保存");
+    } catch { MessagePlugin.error("保存失败"); }
+    finally { setBiliVerifying(false); }
+  };
+
   return (
     <div className="space-y-6 animate-fade-in-up">
       <div>
@@ -114,6 +193,39 @@ export default function Accounts() {
           <Space>
             <Button theme="primary" icon={<RefreshIcon />} loading={verifying} onClick={doVerify}>验证连接</Button>
             <Button variant="outline" icon={<RefreshIcon />} onClick={openChangeDialog}>更改密钥</Button>
+          </Space>
+        </div>
+
+        {/* Bilibili Cookie Card */}
+        <div className="glass-card p-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="w-12 h-12 rounded-lg flex items-center justify-center text-white font-bold text-lg" style={{ backgroundColor: "#fb7299" }}>B</div>
+            <div>
+              <h3 className="font-semibold text-white">B站 Cookie</h3>
+              <div className="flex items-center gap-1 mt-0.5">
+                {biliValid ? (
+                  <><CheckCircleIcon style={{ fontSize: 14, color: "#22c55e" }} /><span className="text-xs text-green-500">已配置</span></>
+                ) : (
+                  <><CloseCircleIcon style={{ fontSize: 14, color: "#64748b" }} /><span className="text-xs text-[#64748b]">未配置</span></>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <p className="text-sm text-[#94a3b8] mb-1">
+            {biliValid
+              ? "B站 Cookie 已配置，评论拉取将使用已登录身份，绕过反爬限制"
+              : "配置后可使用已登录身份拉取 B站评论数据，大幅提升稳定性（未配置时使用免费代理API）"}
+          </p>
+          <p className="text-xs text-[#555] mb-4">
+            获取方法: 登录B站后，按F12 → Application → Cookies → 复制 SESSDATA 等字段
+          </p>
+
+          <Space>
+            <Button theme="primary" icon={<RefreshIcon />} onClick={() => { loadBiliStatus(); setBiliDlgVisible(true); }}>
+              {biliValid ? "更换Cookie" : "配置Cookie"}
+            </Button>
+            {biliValid && <Button variant="outline" onClick={loadBiliStatus}>刷新状态</Button>}
           </Space>
         </div>
 
@@ -165,6 +277,145 @@ export default function Accounts() {
         <div className="space-y-4 py-2">
           <p className="text-xs text-[#64748b]">输入你的 DeepSeek API Key（sk-开头）。<br/>获取地址: platform.deepseek.com/api_keys</p>
           <Input value={dsKey} onChange={v => setDsKey(v as string)} placeholder="sk-xxxxxxxxxxxxxxxx" />
+        </div>
+      </Dialog>
+
+      {/* Bilibili Cookie Dialog - Multi-field */}
+      <Dialog
+        header={
+          <div className="flex items-center justify-between w-full pr-4">
+            <span>配置 B站 Cookie</span>
+            <Button
+              size="small"
+              variant="outline"
+              theme="primary"
+              loading={biliVerifying}
+              onClick={(e) => { e.stopPropagation(); handleBiliVerify(); }}
+            >
+              验证 Cookie
+            </Button>
+          </div>
+        }
+        visible={biliDlgVisible}
+        onClose={() => setBiliDlgVisible(false)}
+        onConfirm={handleBiliSave}
+        confirmBtn="保存"
+        cancelBtn="取消"
+        destroyOnClose
+        width={680}
+        showOverlay
+        closeOnOverlayClick
+      >
+        <div className="space-y-4 py-2">
+          {/* Step-by-step guide */}
+          <div className="bg-[#1e293b] rounded-lg p-3 border border-[#334155]">
+            <p className="text-xs font-semibold text-white mb-2">📋 获取步骤：</p>
+            <ol className="text-xs text-[#94a3b8] space-y-1 pl-4 list-decimal">
+              <li>打开浏览器，访问 <span className="text-pink-400">bilibili.com</span> 并确保已登录</li>
+              <li>按 <kbd className="px-1.5 py-0.5 bg-[#0f172a] rounded text-indigo-300 text-[10px]">F12</kbd> 打开开发者工具</li>
+              <li>点击顶部 <span className="text-yellow-400">Application</span>（应用程序）标签</li>
+              <li>左侧找到 <span className="text-green-400">Cookies → https://www.bilibili.com</span></li>
+              <li>在右侧表格中找到下方列出的字段，复制对应的 <span className="text-indigo-400">Value</span> 值粘贴到输入框</li>
+            </ol>
+          </div>
+
+          {/* Field definitions table */}
+          <div className="text-xs space-y-1.5">
+            <div className="flex items-center gap-2 font-semibold text-white mb-1">
+              <span>字段说明</span>
+              <span className="text-[10px] px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded">必填</span>
+              <span className="text-[10px] px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded">推荐</span>
+              <span className="text-[10px] px-1.5 py-0.5 bg-slate-500/20 text-slate-400 rounded">可选</span>
+            </div>
+
+            {/* SESSDATA */}
+            <div className="grid grid-cols-[140px_1fr_auto] gap-2 items-center bg-[#1e293b]/50 rounded p-2">
+              <div className="flex items-center gap-1.5">
+                <code className="text-indigo-300 font-mono text-[11px]">SESSDATA</code>
+                <span className="text-[9px] px-1 bg-red-500/20 text-red-400 rounded shrink-0">必填</span>
+              </div>
+              <Input
+                value={biliFields.SESSDATA}
+                onChange={(v) => setBiliFields({ ...biliFields, SESSDATA: v as string })}
+                placeholder="粘贴 SESSDATA 的 Value 值..."
+                size="small"
+              />
+              <span className="text-[10px] text-[#555] w-20 text-right">登录凭证</span>
+            </div>
+
+            {/* bili_jct */}
+            <div className="grid grid-cols-[140px_1fr_auto] gap-2 items-center bg-[#1e293b]/50 rounded p-2">
+              <div className="flex items-center gap-1.5">
+                <code className="text-indigo-300 font-mono text-[11px]">bili_jct</code>
+                <span className="text-[9px] px-1 bg-yellow-500/20 text-yellow-400 rounded shrink-0">推荐</span>
+              </div>
+              <Input
+                value={biliFields.bili_jct}
+                onChange={(v) => setBiliFields({ ...biliFields, bili_jct: v as string })}
+                placeholder="粘贴 bili_jct 的 Value 值（可选）..."
+                size="small"
+              />
+              <span className="text-[10px] text-[#555] w-20 text-right">CSRF令牌</span>
+            </div>
+
+            {/* buvid3 */}
+            <div className="grid grid-cols-[140px_1fr_auto] gap-2 items-center bg-[#1e293b]/50 rounded p-2">
+              <div className="flex items-center gap-1.5">
+                <code className="text-indigo-300 font-mono text-[11px]">buvid3</code>
+                <span className="text-[9px] px-1 bg-yellow-500/20 text-yellow-400 rounded shrink-0">推荐</span>
+              </div>
+              <Input
+                value={biliFields.buvid3}
+                onChange={(v) => setBiliFields({ ...biliFields, buvid3: v as string })}
+                placeholder="粘贴 buvid3 的 Value 值（可选）..."
+                size="small"
+              />
+              <span className="text-[10px] text-[#555] w-20 text-right">设备指纹</span>
+            </div>
+
+            {/* DedeUserID */}
+            <div className="grid grid-cols-[140px_1fr_auto] gap-2 items-center bg-[#1e293b]/30 rounded p-2">
+              <div className="flex items-center gap-1.5">
+                <code className="text-indigo-300 font-mono text-[11px]">DedeUserID</code>
+                <span className="text-[9px] px-1 bg-slate-500/20 text-slate-400 rounded shrink-0">可选</span>
+              </div>
+              <Input
+                value={biliFields.DedeUserID}
+                onChange={(v) => setBiliFields({ ...biliFields, DedeUserID: v as string })}
+                placeholder="用户数字ID（可选）..."
+                size="small"
+              />
+              <span className="text-[10px] text-[#555] w-20 text-right">用户ID</span>
+            </div>
+
+            {/* DedeUserID__ckMd5 */}
+            <div className="grid grid-cols-[140px_1fr_auto] gap-2 items-center bg-[#1e293b]/30 rounded p-2">
+              <div className="flex items-center gap-1.5">
+                <code className="text-indigo-300 font-mono text-[11px] leading-tight">DedeUserID__ckMd5</code>
+                <span className="text-[9px] px-1 bg-slate-500/20 text-slate-400 rounded shrink-0">可选</span>
+              </div>
+              <Input
+                value={biliFields.DedeUserID__ckMd5}
+                onChange={(v) => setBiliFields({ ...biliFields, DedeUserID__ckMd5: v as string })}
+                placeholder="用户ID校验值（可选）..."
+                size="small"
+              />
+              <span className="text-[10px] text-[#555] w-20 text-right">ID校验</span>
+            </div>
+          </div>
+
+          {/* Quick reference summary */}
+          <div className="border-t border-[#334155] pt-3 mt-2">
+            <p className="text-[11px] text-[#64748b]">
+              <span className="font-semibold text-white">最低配置：</span>仅需填写 <code className="text-red-400">SESSDATA</code> 即可拉取评论数据
+            </p>
+            <p className="text-[11px] text-[#64748b] mt-1">
+              <span className="font-semibold text-white">完整配置：</span>建议填写前3个字段（SESSDATA + bili_jct + buvid3）以获得最佳稳定性
+            </p>
+            <p className="text-[10px] text-[#475569] mt-1.5">
+              💡 Cookie 有效期通常为数月，失效后需重新获取。SESSDATA 是最核心的登录凭证。
+            </p>
+          </div>
         </div>
       </Dialog>
     </div>

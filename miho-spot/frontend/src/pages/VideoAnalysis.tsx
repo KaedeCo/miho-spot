@@ -52,9 +52,9 @@ function Heatmap3D({ data }: { data: VaResult | null }) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(COLORS.bg);
 
-    // Camera
+    // Camera — look at terrain center from above-right-front
     const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 1000);
-    camera.position.set(70, 80, 100);
+    camera.position.set(130, 70, 140);
 
     // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -62,13 +62,14 @@ function Heatmap3D({ data }: { data: VaResult | null }) {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(renderer.domElement);
 
-    // Controls
+    // Controls — orbit around terrain center
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(50, 10, 50);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.minDistance = 30;
+    controls.minDistance = 40;
     controls.maxDistance = 300;
-    controls.maxPolarAngle = Math.PI / 2 - 0.02; // prevent going below floor
+    controls.maxPolarAngle = Math.PI / 2.4; // slight above-horizon limit, no need to go under
 
     // Lights — hemisphere with symmetrical sky/ground so back-side faces get equal ambient
     scene.add(new THREE.HemisphereLight(0x88aaff, 0x88aaff, 1.2));
@@ -99,10 +100,87 @@ function Heatmap3D({ data }: { data: VaResult | null }) {
       ]);
       return new THREE.Line(geo, new THREE.LineBasicMaterial({ color }));
     }
-    // X-axis (anti→pro mihoyo): along X direction at Y=0 edge
+    // X-axis (anti→pro mihoyo): along X direction at Z=-2 below floor
     scene.add(makeAxisLine([0, 0, -2], [100, 0, -2], 0x6366f1));
-    // Y-axis (rational→emotional): along Z direction at X=-2 edge
+    // Z-axis (rational→emotional): along Z direction at X=-2
     scene.add(makeAxisLine([-2, 0, 0], [-2, 0, 100], 0x8b5cf6));
+    // Y-axis (height): vertical at origin
+    scene.add(makeAxisLine([-2, 0, -2], [-2, 40, -2], 0x22c55e));
+
+
+    // ===== Helper: make Tick / Label / WallGrid =====
+    function makeTick(pos: [number, number, number], dir: [number, number, number], size: number, color: number) {
+      return makeAxisLine(pos, [pos[0] + dir[0] * size, pos[1] + dir[1] * size, pos[2] + dir[2] * size], color);
+    }
+    function makeLabel(text: string, pos: [number, number, number]): THREE.Sprite {
+      const cvs = document.createElement("canvas");
+      cvs.width = 64;
+      cvs.height = 32;
+      const cctx = cvs.getContext("2d")!;
+      cctx.fillStyle = "#ffffff";
+      cctx.font = "bold 22px sans-serif";
+      cctx.textAlign = "center";
+      cctx.textBaseline = "middle";
+      cctx.fillText(text, 32, 16);
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false });
+      const sprite = new THREE.Sprite(mat);
+      sprite.scale.set(7, 3.5, 1);
+      sprite.position.set(...pos);
+      return sprite;
+    }
+    function makeWallGrid(xMin: number, xMax: number, yMin: number, yMax: number, zMin: number, zMax: number,
+                          color: number, div10: number, divHeight: number): THREE.Group {
+      const g = new THREE.Group();
+      const lineMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.25 });
+      // lines along one axis, at steps of the other
+      // X-lines: from xMin..xMax at each z-step and y-step
+      for (let y = yMin; y <= yMax; y += divHeight) {
+        const pts = [new THREE.Vector3(xMin, y, zMin), new THREE.Vector3(xMax, y, zMin)];
+        g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat));
+      }
+      // Z-lines: from zMin..zMax at each y-step
+      for (let y = yMin; y <= yMax; y += divHeight) {
+        const pts = [new THREE.Vector3(xMin, y, zMin), new THREE.Vector3(xMin, y, zMax)];
+        g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat));
+      }
+      // Vertical lines: at each intersection
+      for (let h = xMin; h <= xMax; h += div10) {
+        const pts = [new THREE.Vector3(h, yMin, zMin), new THREE.Vector3(h, yMax, zMin)];
+        g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat));
+      }
+      for (let h = zMin; h <= zMax; h += div10) {
+        const pts = [new THREE.Vector3(xMin, yMin, h), new THREE.Vector3(xMin, yMax, h)];
+        g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat));
+      }
+      return g;
+    }
+
+    const tickColor = 0x64748b;
+    const wallColor = 0x334155;
+
+    // ---- XZ floor grid ticks + labels (same as before) ----
+    for (let i = 10; i <= 100; i += 10) {
+      scene.add(makeTick([i, 0, -2], [0, 0, -1], 3, tickColor));
+      scene.add(makeTick([-2, 0, i], [-1, 0, 0], 3, tickColor));
+      scene.add(makeLabel(i.toString(), [i, 0, -6]));
+      scene.add(makeLabel(i.toString(), [-7, 0, i]));
+    }
+
+    // ---- XY wall (Z=0): 反对-支持 × 高度 (grid only, X labels from floor) ----
+    scene.add(makeWallGrid(0, 100, 0, 40, 0, 0, wallColor, 10, 10));
+    // Y (height) labels on XY wall edge
+    for (let y = 10; y <= 40; y += 10) {
+      scene.add(makeTick([-2, y, 0], [-1, 0, 0], 3, tickColor));
+      scene.add(makeLabel(y.toString(), [-7, y, 0]));
+    }
+
+    // ---- YZ wall (X=0): 理性-感性 × 高度 (grid only, Z labels from floor) ----
+    scene.add(makeWallGrid(0, 0, 0, 40, 0, 100, wallColor, 10, 10));
+    // Origin "0" label at corner
+    scene.add(makeLabel("0", [-7, 0, -6]));
 
     // Height scale: max Z determines height scaling
     const maxZ = Math.max(...data.points.map((p) => p.z), 1);
@@ -377,6 +455,7 @@ export default function VideoAnalysis() {
           }
           setFetching(false);
           setAnalyzing(false);
+          sessionStorage.removeItem("va_active_task");
         }
       } catch {}
     }, 2000);
@@ -396,6 +475,7 @@ export default function VideoAnalysis() {
       MessagePlugin.info(res.message || "开始拉取评论...");
       startPolling();
       setActiveTaskId(res.taskId!);
+      sessionStorage.setItem("va_active_task", res.taskId!);
     } catch (e: any) {
       MessagePlugin.error(e.message || "拉取失败");
       setFetching(false);
@@ -497,8 +577,21 @@ export default function VideoAnalysis() {
   };
 
   // Initial load & cleanup
-  useEffect(() => { loadTasks(); return () => { if (pollRef.current) clearInterval(pollRef.current); }; }, []);
+  useEffect(() => {
+    loadTasks();
+    getSavedVaTasks().then(r => setSavedTasks(r.items)).catch(() => {});
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
   useEffect(() => { startPolling(); return () => {}; }, [fetching, analyzing]);
+  // Recover orphaned task on mount (user navigated away and came back)
+  useEffect(() => {
+    const saved = sessionStorage.getItem("va_active_task");
+    if (saved) {
+      setActiveTaskId(saved);
+      setFetching(true);
+    }
+    return () => {};
+  }, []);
 
   const activeTask = tasks.find((t) => t.id === activeTaskId);
   const isProcessing = fetching || analyzing || (activeTask?.status === "fetching" || activeTask?.status === "analyzing");

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Button, Loading, MessagePlugin, Tag } from "tdesign-react";
+import { Button, Loading, MessagePlugin, Tag, Checkbox } from "tdesign-react";
 import {
   SearchIcon,
   RefreshIcon,
@@ -7,7 +7,12 @@ import {
   FileSearchIcon,
   TimeIcon,
 } from "tdesign-icons-react";
-import { getSavedVaTasks, getDeepAnalyses, startDeepAnalysis, getDeepAnalysisStatus, deleteDeepAnalysis, getDeepAnalysisResult } from "../services/api";
+import {
+  getSavedVaTasks, getDeepAnalyses, startDeepAnalysis, getDeepAnalysisStatus,
+  deleteDeepAnalysis, getDeepAnalysisResult,
+  getPdfModules, generatePdfReport, getPdfProgress, downloadPdfReport, otListSaved,
+  type PdfModule
+} from "../services/api";
 import type { SavedVaTask, DeepAnalysisItem } from "../types";
 
 export default function DeepAnalysisPage() {
@@ -221,6 +226,141 @@ export default function DeepAnalysisPage() {
           </div>
         </div>
       )}
+
+      {/* PDF Report Customization */}
+      <PdfReportSection />
+    </div>
+  );
+}
+
+/** PDF Report customization — embedded in DeepAnalysis page */
+function PdfReportSection() {
+  const [modules, setModules] = useState<PdfModule[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [savedList, setSavedList] = useState<any[]>([]);
+  const [savedId, setSavedId] = useState<number | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [progress, setProgress] = useState({ step: 0, total: 1, message: "", error: "" });
+
+  useEffect(() => {
+    getPdfModules().then(r => setModules(r.modules || [])).catch(() => {});
+    otListSaved().then(r => setSavedList(r.items || [])).catch(() => {});
+    const saved = sessionStorage.getItem("pdf_active_job");
+    if (saved) { setJobId(saved); setGenerating(true); }
+  }, []);
+
+  useEffect(() => {
+    if (!jobId) return;
+    const iv = setInterval(async () => {
+      try {
+        const p = await getPdfProgress(jobId);
+        setProgress({ step: p.step, total: p.total, message: p.message, error: p.error || "" });
+        if (p.status === "done") {
+          clearInterval(iv);
+          setGenerating(false);
+          sessionStorage.removeItem("pdf_active_job");
+          downloadPdfReport(jobId).then(() => MessagePlugin.success("PDF已下载")).catch(() => {});
+          setJobId(null);
+        } else if (p.status === "error") {
+          clearInterval(iv);
+          setGenerating(false);
+          sessionStorage.removeItem("pdf_active_job");
+          setJobId(null);
+        }
+      } catch { }
+    }, 600);
+    return () => clearInterval(iv);
+  }, [jobId]);
+
+  const toggle = (key: string) => setSelected(prev => {
+    const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n;
+  });
+  const selectAll = () => {
+    if (selected.size === modules.length) setSelected(new Set());
+    else setSelected(new Set(modules.map(m => m.key)));
+  };
+  const handleGenerate = async () => {
+    if (!savedId) { MessagePlugin.warning("请选择一个已保存的推演结果"); return; }
+    if (selected.size === 0) { MessagePlugin.warning("请至少勾选一个模块"); return; }
+    setGenerating(true);
+    setProgress({ step: 0, total: selected.size + 3, message: "正在提交...", error: "" });
+    try {
+      const r = await generatePdfReport(savedId, Array.from(selected));
+      setJobId(r.jobId);
+      sessionStorage.setItem("pdf_active_job", r.jobId);
+    } catch (e: any) { MessagePlugin.error(e.message || "提交失败"); setGenerating(false); }
+  };
+  const pct = Math.min(100, Math.round((progress.step / Math.max(1, progress.total)) * 100));
+
+  return (
+    <div className="glass-card rounded-xl p-5 space-y-4">
+      <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+        <span className="w-1.5 h-4 bg-purple-400 rounded-full" />
+        PDF报告定制
+      </h3>
+      <p className="text-xs text-gray-400">勾选分析模块，从已保存的舆情推演结果生成定制化PDF报告</p>
+
+      {/* Progress bar */}
+      {generating && (
+        <div className="bg-[#1e293b] rounded-lg p-3 border border-[#334155] space-y-2">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="text-[#94a3b8]">{progress.message || "准备中..."}</span>
+            <span className="text-white font-mono">{pct}%</span>
+          </div>
+          <div className="w-full h-2 bg-[#0f172a] rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-300" style={{
+              width: `${pct}%`,
+              background: progress.error ? "#ef4444" : "linear-gradient(to right, #6366f1, #8b5cf6)",
+            }} />
+          </div>
+          <div className="text-[10px] text-[#64748b]">步骤 {progress.step}/{progress.total}</div>
+          {progress.error && (
+            <div className="text-[11px] text-red-400 bg-red-500/10 rounded p-2 border border-red-500/20">{progress.error}</div>
+          )}
+        </div>
+      )}
+
+      {/* Saved result selector */}
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-gray-400 shrink-0">推演结果：</span>
+        <select
+          className="flex-1 bg-[#1e293b] border border-[#334155] rounded px-3 py-1.5 text-sm text-white"
+          value={savedId || ""}
+          onChange={e => setSavedId(Number(e.target.value) || null)}
+        >
+          <option value="">-- 请选择已保存的推演结果 --</option>
+          {savedList.map(s => (
+            <option key={s.id} value={s.id}>{s.title || s.bvid} ({s.totalComments}评)</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Modules */}
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-gray-400">分析模块 ({selected.size}/{modules.length})</span>
+        <Button size="small" variant="text" className="!text-[11px]" onClick={selectAll}>
+          {selected.size === modules.length ? "取消全选" : "全选"}
+        </Button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-[300px] overflow-y-auto">
+        {modules.map(m => (
+          <div key={m.key}
+            className={`flex items-start gap-2 p-2.5 rounded cursor-pointer transition-colors ${selected.has(m.key) ? "bg-indigo-500/15 border border-indigo-500/30" : "hover:bg-white/5 border border-transparent"}`}
+            onClick={() => toggle(m.key)}
+          >
+            <Checkbox checked={selected.has(m.key)} onChange={() => toggle(m.key)} className="mt-0.5 shrink-0" />
+            <div>
+              <div className="text-xs text-white font-medium">{m.label}</div>
+              <div className="text-[10px] text-gray-500 leading-tight">{m.description}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <Button theme="primary" block loading={generating} disabled={generating} onClick={handleGenerate}>
+        {generating ? "生成中..." : "生成PDF报告"}
+      </Button>
     </div>
   );
 }

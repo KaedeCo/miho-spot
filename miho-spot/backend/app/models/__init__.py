@@ -248,8 +248,128 @@ class IdentityQueue(Base):
     added_at = Column(DateTime, default=datetime.utcnow)
 
 
+# ==================== Opinion Timeline (舆情推演) ====================
+
+class OpinionTimelineTask(Base):
+    """Opinion timeline evolution task — time-ordered comment analysis with centroid drift tracking."""
+    __tablename__ = "opinion_timeline_tasks"
+
+    id = Column(String, primary_key=True)          # UUID
+    bvid = Column(String, nullable=False)
+    aid = Column(Integer, default=0)
+    title = Column(Text, default="")
+    cover_url = Column(Text, default="")
+    url = Column(Text, default="")
+
+    # Status: idle | fetching | fetched | analyzing | done | error
+    status = Column(String, default="idle")
+    error_msg = Column(Text, default="")
+
+    # Counts
+    total_comments = Column(Integer, default=0)
+    analyzed_count = Column(Integer, default=0)
+
+    # 2D heatmap grid: 101x101 array grid[x][y] = comment count at (x,y)
+    heatmap_grid = Column(JSON, default=None)
+
+    # Centroid trail: array of {x, y, t: timestamp_label, count: int}
+    centroid_trail = Column(JSON, default=None)
+
+    # Final centroid (all comments)
+    centroid_x = Column(Float, default=0.0)
+    centroid_y = Column(Float, default=0.0)
+
+    # Time range
+    time_start = Column(Integer, default=0)  # earliest comment ctime
+    time_end = Column(Integer, default=0)    # latest comment ctime
+
+    # Raw comment data with coordinates: [{content, ctime, x, y}, ...]
+    comments_data = Column(JSON, default=None)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SavedOpinionTimelineTask(Base):
+    """Archived opinion timeline analysis results."""
+    __tablename__ = "saved_opinion_timeline_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_task_id = Column(String, nullable=False)
+    bvid = Column(String, nullable=False)
+    title = Column(Text, default="")
+    cover_url = Column(Text, default="")
+
+    total_comments = Column(Integer, default=0)
+    analyzed_count = Column(Integer, default=0)
+
+    heatmap_grid = Column(JSON, default=None)
+    centroid_trail = Column(JSON, default=None)
+    centroid_x = Column(Float, default=0.0)
+    centroid_y = Column(Float, default=0.0)
+    time_start = Column(Integer, default=0)
+    time_end = Column(Integer, default=0)
+
+    # User-marked timeline landmark nodes (indices into centroid_trail)
+    node_indices = Column(JSON, default=None)
+
+    # Raw comment data with coordinates (for clustering)
+    comments_data = Column(JSON, default=None)
+
+    saved_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ClusterAnalysis(Base):
+    """Cluster analysis results for opinion timeline data."""
+    __tablename__ = "cluster_analyses"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    saved_timeline_id = Column(Integer, nullable=False)
+    bvid = Column(String, default="")
+    title = Column(Text, default="")
+
+    total_comments = Column(Integer, default=0)
+    cluster_count = Column(Integer, default=0)
+
+    # clusters: [{id, centroid: {x,y}, members: [{x,y,content}], boundary: [[x,y],...],
+    #             deepseek: {definition, coreClaim, arguments: [], materialBasis}}]
+    clusters = Column(JSON, default=None)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _migrate_columns()
+
+
+def _migrate_columns():
+    """Add missing columns to existing tables without dropping data."""
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+
+    # --- saved_opinion_timeline_tasks: add node_indices ---
+    if "saved_opinion_timeline_tasks" in inspector.get_table_names():
+        cols = {c["name"] for c in inspector.get_columns("saved_opinion_timeline_tasks")}
+        if "node_indices" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE saved_opinion_timeline_tasks ADD COLUMN node_indices JSON"))
+                conn.commit()
+                print("[Migrate] Added node_indices column to saved_opinion_timeline_tasks")
+        if "comments_data" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE saved_opinion_timeline_tasks ADD COLUMN comments_data JSON"))
+                conn.commit()
+                print("[Migrate] Added comments_data column to saved_opinion_timeline_tasks")
+
+    # --- opinion_timeline_tasks: add comments_data ---
+    if "opinion_timeline_tasks" in inspector.get_table_names():
+        cols = {c["name"] for c in inspector.get_columns("opinion_timeline_tasks")}
+        if "comments_data" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE opinion_timeline_tasks ADD COLUMN comments_data JSON"))
+                conn.commit()
+                print("[Migrate] Added comments_data column to opinion_timeline_tasks")
 
 
 def get_db():
