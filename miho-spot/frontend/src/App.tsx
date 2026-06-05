@@ -12,6 +12,8 @@ import WordCloud from "./pages/WordCloud";
 import DeepAnalysisPage from "./pages/DeepAnalysis";
 import OpinionTimeline from "./pages/OpinionTimeline";
 import ClusterAnalysis from "./pages/ClusterAnalysis";
+import DebateHall from "./pages/DebateHall";
+import DebateReplay from "./pages/DebateReplay";
 
 export default function App() {
   return (
@@ -30,6 +32,8 @@ export default function App() {
           <Route path="/word-cloud" element={<WordCloud />} />
           <Route path="/deep-analysis" element={<DeepAnalysisPage />} />
           <Route path="/accounts" element={<Accounts />} />
+          <Route path="/debate-hall" element={<DebateHall />} />
+          <Route path="/debate-replay" element={<DebateReplay />} />
         </Route>
       </Routes>
     </BrowserRouter>

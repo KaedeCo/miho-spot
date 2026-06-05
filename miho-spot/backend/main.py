@@ -22,7 +22,7 @@ from datetime import datetime
 def seed_default_data():
     db = SessionLocal()
     try:
-        platforms = ["zhihu", "douyin", "tieba", "tophub"]
+        platforms = ["zhihu", "douyin", "tieba", "tophub", "bilibili"]
         for p in platforms:
             existing = db.query(AccountModel).filter(AccountModel.platform == p).first()
             if not existing:

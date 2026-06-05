@@ -16,6 +16,7 @@ import {
   FileSearchIcon,
   TimeIcon,
   UsergroupIcon,
+  ChatBubbleIcon,
 } from "tdesign-icons-react";
 import { getPdfModules, generatePdfReport, getPdfProgress, downloadPdfReport, otListSaved, type PdfModule } from "../services/api";
 
@@ -31,6 +32,8 @@ const menuItems = [
   { path: "/cluster-analysis", label: "聚类分群", icon: <UsergroupIcon /> },
   { path: "/word-cloud", label: "词云", icon: <CloudIcon /> },
   { path: "/deep-analysis", label: "深度分析", icon: <FileSearchIcon /> },
+  { path: "/debate-hall", label: "舆情辩论厅", icon: <ChatBubbleIcon /> },
+  { path: "/debate-replay", label: "辩论回放", icon: <TimeIcon /> },
   { path: "/accounts", label: "账号管理", icon: <SettingIcon /> },
 ];
 

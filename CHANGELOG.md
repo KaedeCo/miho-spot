@@ -1,5 +1,37 @@
 # Miho-spot Changelog
 
+## [v1.5.0] — 2026-06-06
+
+### 多Agent瑞士轮辩论厅
+
+- 三个专业化Agent（A1私有数据/A2官媒/A3公域）通过8轮结构化辩论探索舆情真相
+- 双轨搜索引擎：火山方舟 Ark Bot（主）+ Tavily（备），自动Fallback
+- Two-Pass智能体架构：Pass1强制搜索 → Pass2专注分析写作
+- 监督Agent策展整合 → 生成结构化最终报告 + PDF
+
+#### 后端
+- 新增 `debate/` 模块（2003行）：orchestrator + agents + prompts + search_tools + data_exchange
+- 3个SQLAlchemy模型：DebateSession + DebateFact + DebateRoundSnapshot
+- 10个API路由：create/stream(SSE)/confirm-facts/save/sessions/report/replay/pdf/delete + 4个search测试端点
+- Accounts页：火山方舟 API Key + Endpoint ID、Tavily API Key 配置（含验证+测试搜索按钮）
+
+#### 前端
+- DebateHall（辩论大厅）：三终端面板SSE流式输出，颜色编码（蓝/灰/紫/绿），事实确认面板
+- DebateReplay（辩论回放）：竖向时间轴+彩色发言者横栏+react-markdown渲染+PDF下载
+- 4个新组件：AgentTerminal + DebateProgress + FactConfirmPanel + DebateReportPreview
+- Cascadia Code等宽字体终端渲染
+
+#### Bug修复
+- data_dir null → 辩论回放无数据（记录在run()之前创建）
+- PDF下载仅查内存 → 新增DB/磁盘二级查找
+- Agent只搜索不分析 → Two-Pass架构根本性修复
+- 监督报告字数截断 → max_tokens参数化
+- 事实面板单条提交关闭 → filter已提交事实
+- React重复Key → UUID扩展+前端去重
+- 辩论回放404 → 缺失archive目录时优雅降级
+
+---
+
 ## [v1.3.0] — 2026-06-03
 
 ### 全栈稳定性修复与数据流完善

@@ -371,6 +371,67 @@ def _migrate_columns():
                 conn.commit()
                 print("[Migrate] Added comments_data column to opinion_timeline_tasks")
 
+    # --- Create debate tables if not exist ---
+    Base.metadata.create_all(bind=engine)
+
+
+# ======================================================================
+#  Debate (Agent Swiss Tournament) Models
+# ======================================================================
+
+class DebateSession(Base):
+    __tablename__ = "debate_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    topic = Column(String(500), nullable=False)
+    status = Column(String(20), default="created")
+    current_round = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    final_report = Column(Text, nullable=True)
+    data_dir = Column(String(500), nullable=True)
+    archive_dir = Column(String(500), nullable=True)
+    ds_api_key_used = Column(String(200), nullable=True)
+    search_track_final = Column(String(20), nullable=True)
+
+    facts = relationship("DebateFact", back_populates="session", cascade="all, delete-orphan")
+
+
+class DebateFact(Base):
+    __tablename__ = "debate_facts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, ForeignKey("debate_sessions.id"), nullable=False)
+    fact_id = Column(String(30), nullable=False)
+    content = Column(Text, nullable=False)
+    original_content = Column(Text, nullable=True)
+    status = Column(String(20), default="pending")
+    confidence = Column(Float, default=1.0)
+    source_agent = Column(String(10), nullable=False)
+    user_action = Column(String(20), nullable=True)
+    modified_by_user = Column(String(10), nullable=True)
+    evidence = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    confirmed_at = Column(DateTime, nullable=True)
+
+    session = relationship("DebateSession", back_populates="facts")
+
+
+class DebateRoundSnapshot(Base):
+    __tablename__ = "debate_round_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, ForeignKey("debate_sessions.id"), nullable=False)
+    round_num = Column(Integer, nullable=False)
+    agent_id = Column(String(10), nullable=False)
+    stage = Column(String(20), nullable=False)
+    system_prompt = Column(Text, nullable=True)
+    input_context = Column(Text, nullable=True)
+    tool_calls = Column(Text, nullable=True)
+    raw_output = Column(Text, nullable=True)
+    fact_changes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 def get_db():
     db = SessionLocal()

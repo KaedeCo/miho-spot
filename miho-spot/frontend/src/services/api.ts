@@ -2,13 +2,16 @@ import type { DashboardData, HotTopic, AnalysisResult, DailyStats, KeywordEntry,
 
 const BASE_URL = "/api";
 
-async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
+async function fetchJSON<T>(url: string, options?: RequestInit, timeoutMs: number = 120000): Promise<T> {
   const fullUrl = `${BASE_URL}${url}`;
   console.log(`[API] ${options?.method || "GET"} ${fullUrl}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const res = await fetch(fullUrl, {
     headers: { "Content-Type": "application/json" },
+    signal: controller.signal,
     ...options,
-  });
+  }).finally(() => clearTimeout(timer));
   if (!res.ok) {
     const text = await res.text().catch(() => "(empty)");
     console.error(`[API] ${res.status} ${fullUrl}: ${text.slice(0, 300)}`);
@@ -423,3 +426,90 @@ export async function downloadPdfReport(jobId: string): Promise<void> {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+// ======================================================================
+//  Search API Keys (Volcano + Tavily)
+// ======================================================================
+
+export async function verifyVolcano(apiKey: string, endpointId: string) {
+  const resp = await fetch('/api/search/verify-volcano', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey, endpointId }),
+  });
+  return resp.json();
+}
+
+export async function verifyTavily(apiKey: string) {
+  const resp = await fetch('/api/search/verify-tavily', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey }),
+  });
+  return resp.json();
+}
+
+export async function getSearchStatus() {
+  const resp = await fetch('/api/search/status');
+  return resp.json();
+}
+
+export async function testVolcanoSearch() {
+  const resp = await fetch('/api/search/test-volcano', { method: 'POST' });
+  return resp.json();
+}
+
+export async function testTavilySearch() {
+  const resp = await fetch('/api/search/test-tavily', { method: 'POST' });
+  return resp.json();
+}
+
+// ======================================================================
+//  Agent Swiss Tournament Debate API
+// ======================================================================
+
+export const debateApi = {
+  create: async (topic: string) => {
+    const resp = await fetch('/api/debate/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic }),
+    });
+    if (!resp.ok) throw new Error('创建辩论失败');
+    return resp.json();
+  },
+
+  confirmFacts: async (sessionId: string, actions: any[]) => {
+    const resp = await fetch(`/api/debate/confirm-facts/${sessionId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actions }),
+    });
+    if (!resp.ok) throw new Error('事实确认失败');
+    return resp.json();
+  },
+
+  save: async (sessionId: string) => {
+    const resp = await fetch(`/api/debate/save/${sessionId}`, { method: 'POST' });
+    if (!resp.ok) throw new Error('保存失败');
+    return resp.json();
+  },
+
+  getReport: async (sessionId: string) => {
+    const resp = await fetch(`/api/debate/report/${sessionId}`);
+    if (!resp.ok) throw new Error('获取报告失败');
+    return resp.json();
+  },
+
+  listSessions: async () => {
+    const resp = await fetch('/api/debate/sessions');
+    if (!resp.ok) throw new Error('获取会话列表失败');
+    return resp.json();
+  },
+
+  deleteSession: async (sessionId: string) => {
+    const resp = await fetch(`/api/debate/session/${sessionId}`, { method: 'DELETE' });
+    if (!resp.ok) throw new Error('删除失败');
+    return resp.json();
+  },
+};

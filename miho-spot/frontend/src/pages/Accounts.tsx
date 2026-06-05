@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Button, Input, Dialog, MessagePlugin, Space, Textarea } from "tdesign-react";
 import { CheckCircleIcon, CloseCircleIcon, RefreshIcon } from "tdesign-icons-react";
-import { verifyAccount, saveAccount, verifyDeepSeek, getDeepSeekStatus, getAccounts } from "../services/api";
+import { verifyAccount, saveAccount, verifyDeepSeek, getDeepSeekStatus, getAccounts, verifyVolcano, verifyTavily, getSearchStatus, testVolcanoSearch, testTavilySearch } from "../services/api";
 
 const API_KEY_DEFAULT = "";
 const STORAGE_KEY = "miho_accounts_v3";
@@ -37,6 +37,24 @@ export default function Accounts() {
   const [dsKey, setDsKey] = useState("");
   const [dsVerifying, setDsVerifying] = useState(false);
 
+  // Volcano states
+  const [vaConfigured, setVaConfigured] = useState(false);
+  const [vaDlgVisible, setVaDlgVisible] = useState(false);
+  const [vaKey, setVaKey] = useState("");
+  const [vaBotId, setVaBotId] = useState("");
+  const [vaVerifying, setVaVerifying] = useState(false);
+
+  // Tavily states
+  const [tvConfigured, setTvConfigured] = useState(false);
+  const [tvDlgVisible, setTvDlgVisible] = useState(false);
+  const [tvKey, setTvKey] = useState("");
+  const [tvVerifying, setTvVerifying] = useState(false);
+
+  // Test search result states
+  const [testResult, setTestResult] = useState<{ title: string; content: string } | null>(null);
+  const [testDlgVisible, setTestDlgVisible] = useState(false);
+  const [testing, setTesting] = useState(false);
+
   // Bilibili cookie states - multi-field
   interface BiliCookieFields {
     SESSDATA: string;
@@ -55,9 +73,18 @@ export default function Accounts() {
     DedeUserID: "",
     DedeUserID__ckMd5: "",
   });
+  const [biliSaving, setBiliSaving] = useState(false);
   const [biliVerifying, setBiliVerifying] = useState(false);
 
-  useEffect(() => { loadDsStatus(); loadBiliStatus(); }, []);
+  useEffect(() => { loadDsStatus(); loadBiliStatus(); loadSearchStatus(); }, []);
+
+  const loadSearchStatus = async () => {
+    try {
+      const r = await getSearchStatus();
+      setVaConfigured(r.volcano?.isValid || false);
+      setTvConfigured(r.tavily?.isValid || false);
+    } catch {}
+  };
 
   const loadDsStatus = async () => {
     try {
@@ -102,6 +129,61 @@ export default function Accounts() {
       if (r.isValid) { setDsConfigured(true); setDsValid(true); setDsDlgVisible(false); setDsKey(""); }
     } catch { MessagePlugin.error("后端未连接"); }
     finally { setDsVerifying(false); }
+  };
+
+  // --- Volcano handlers ---
+  const handleVaVerify = async () => {
+    if (!vaKey.trim()) { MessagePlugin.warning("请输入火山方舟 API Key"); return; }
+    if (!vaBotId.trim()) { MessagePlugin.warning("请输入端点 ID"); return; }
+    setVaVerifying(true);
+    try {
+      const r = await verifyVolcano(vaKey.trim(), vaBotId.trim());
+      MessagePlugin[r.isValid ? "success" : "warning"](r.message);
+      if (r.isValid) { setVaConfigured(true); setVaDlgVisible(false); setVaKey(""); setVaBotId(""); }
+    } catch { MessagePlugin.error("后端未连接"); }
+    finally { setVaVerifying(false); }
+  };
+
+  // --- Tavily handlers ---
+  const handleTvVerify = async () => {
+    if (!tvKey.trim()) { MessagePlugin.warning("请输入 Tavily API Key"); return; }
+    setTvVerifying(true);
+    try {
+      const r = await verifyTavily(tvKey.trim());
+      MessagePlugin[r.isValid ? "success" : "warning"](r.message);
+      if (r.isValid) { setTvConfigured(true); setTvDlgVisible(false); setTvKey(""); }
+    } catch { MessagePlugin.error("后端未连接"); }
+    finally { setTvVerifying(false); }
+  };
+
+  // --- Test search handlers ---
+  const handleTestVolcano = async () => {
+    setTesting(true);
+    try {
+      const r = await testVolcanoSearch();
+      if (r.ok && r.results?.length) {
+        setTestResult({ title: '火山方舟搜索测试结果', content: r.results[0]?.substring?.(0, 1000) || String(r.results[0]) });
+      } else {
+        setTestResult({ title: '测试失败', content: r.error || '未知错误' });
+      }
+      setTestDlgVisible(true);
+    } catch { MessagePlugin.error("测试请求失败"); }
+    finally { setTesting(false); }
+  };
+
+  const handleTestTavily = async () => {
+    setTesting(true);
+    try {
+      const r = await testTavilySearch();
+      if (r.ok && r.results?.length) {
+        const items = r.results.map((it: any) => `[${it.title}](${it.url})\n${it.content}`).join('\n\n');
+        setTestResult({ title: 'Tavily 搜索测试结果', content: items.substring(0, 1500) });
+      } else {
+        setTestResult({ title: '测试失败', content: r.error || '未知错误' });
+      }
+      setTestDlgVisible(true);
+    } catch { MessagePlugin.error("测试请求失败"); }
+    finally { setTesting(false); }
   };
 
   // --- Bilibili handlers ---
@@ -151,7 +233,7 @@ export default function Accounts() {
 
   const handleBiliSave = async () => {
     if (!biliFields.SESSDATA.trim()) { MessagePlugin.warning("至少需要填写 SESSDATA 字段"); return; }
-    setBiliVerifying(true);
+    setBiliSaving(true);
     try {
       const cookieStr = buildCookieString(biliFields);
       await saveAccount({ platform: "bilibili", username: biliFields.DedeUserID || "", cookie: cookieStr, isValid: true, lastVerified: new Date().toISOString() });
@@ -159,8 +241,8 @@ export default function Accounts() {
       setBiliValid(true);
       setBiliDlgVisible(false);
       MessagePlugin.success("B站Cookie已保存");
-    } catch { MessagePlugin.error("保存失败"); }
-    finally { setBiliVerifying(false); }
+    } catch { MessagePlugin.error("后端未连接，请检查后端是否启动"); }
+    finally { setBiliSaving(false); }
   };
 
   return (
@@ -262,6 +344,72 @@ export default function Accounts() {
             {dsConfigured && <Button variant="outline" onClick={loadDsStatus}>刷新状态</Button>}
           </Space>
         </div>
+
+        {/* Volcano Ark Card */}
+        <div className="glass-card p-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="w-12 h-12 rounded-lg flex items-center justify-center text-white font-bold text-lg" style={{ backgroundColor: "#f97316" }}>V</div>
+            <div>
+              <h3 className="font-semibold text-white">火山方舟</h3>
+              <p className="text-xs text-[#94a3b8] mt-0.5">智能体联网搜索（主轨）</p>
+              <div className="flex items-center gap-1 mt-1">
+                {vaConfigured ? (
+                  <><CheckCircleIcon style={{ fontSize: 14, color: "#22c55e" }} /><span className="text-xs text-green-500">已激活</span></>
+                ) : (
+                  <><CloseCircleIcon style={{ fontSize: 14, color: "#94a3b8" }} /><span className="text-xs text-[#94a3b8]">未配置</span></>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <p className="text-sm text-[#94a3b8] mb-1">
+            {vaConfigured ? "火山方舟 Bot 已配置，辩论 Agent 将通过联网插件进行搜索（月免2万次）" : "配置后 Agent 辩论将通过火山方舟 Bot 进行联网搜索，每月免费2万次"}
+          </p>
+          <p className="text-xs text-[#555] mb-4">
+            获取: <a href="https://console.volcengine.com/ark" target="_blank" rel="noopener noreferrer" className="text-orange-400 hover:text-orange-300">console.volcengine.com</a> → 在线推理 → 创建接入点(DeepSeek-V3.2) → 复制端点ID
+          </p>
+
+          <Space>
+            <Button theme="primary" icon={<RefreshIcon />} loading={vaVerifying} onClick={() => { setVaKey(""); setVaBotId(""); setVaDlgVisible(true); }}>
+              {vaConfigured ? "更换配置" : "配置火山方舟"}
+            </Button>
+            {vaConfigured && <Button variant="outline" onClick={loadSearchStatus}>刷新状态</Button>}
+            {vaConfigured && <Button variant="outline" loading={testing} onClick={handleTestVolcano}>🧪 测试搜索</Button>}
+          </Space>
+        </div>
+
+        {/* Tavily Card */}
+        <div className="glass-card p-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="w-12 h-12 rounded-lg flex items-center justify-center text-white font-bold text-lg" style={{ backgroundColor: "#3b82f6" }}>T</div>
+            <div>
+              <h3 className="font-semibold text-white">Tavily Search</h3>
+              <p className="text-xs text-[#94a3b8] mt-0.5">AI 搜索引擎（备轨）</p>
+              <div className="flex items-center gap-1 mt-1">
+                {tvConfigured ? (
+                  <><CheckCircleIcon style={{ fontSize: 14, color: "#22c55e" }} /><span className="text-xs text-green-500">已激活</span></>
+                ) : (
+                  <><CloseCircleIcon style={{ fontSize: 14, color: "#94a3b8" }} /><span className="text-xs text-[#94a3b8]">未配置</span></>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <p className="text-sm text-[#94a3b8] mb-1">
+            {tvConfigured ? "Tavily 已配置，火山方舟配额耗尽时将自动切换到此备轨" : "配置后作为备轨——火山方舟月免用完后自动切换，每月免费1000次"}
+          </p>
+          <p className="text-xs text-[#555] mb-4">
+            获取API Key: <a href="https://tavily.com" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300">tavily.com</a>
+          </p>
+
+          <Space>
+            <Button theme="primary" icon={<RefreshIcon />} loading={tvVerifying} onClick={() => { setTvKey(""); setTvDlgVisible(true); }}>
+              {tvConfigured ? "更换密钥" : "配置 Tavily"}
+            </Button>
+            {tvConfigured && <Button variant="outline" onClick={loadSearchStatus}>刷新状态</Button>}
+            {tvConfigured && <Button variant="outline" loading={testing} onClick={handleTestTavily}>🧪 测试搜索</Button>}
+          </Space>
+        </div>
       </div>
 
       {/* Change API Key Dialog */}
@@ -277,6 +425,46 @@ export default function Accounts() {
         <div className="space-y-4 py-2">
           <p className="text-xs text-[#64748b]">输入你的 DeepSeek API Key（sk-开头）。<br/>获取地址: platform.deepseek.com/api_keys</p>
           <Input value={dsKey} onChange={v => setDsKey(v as string)} placeholder="sk-xxxxxxxxxxxxxxxx" />
+        </div>
+      </Dialog>
+
+      {/* Volcano Ark Dialog */}
+      <Dialog header="配置火山方舟" visible={vaDlgVisible} onClose={() => setVaDlgVisible(false)} onConfirm={handleVaVerify} confirmBtn="验证并保存" cancelBtn="取消" destroyOnClose width={500}>
+        <div className="space-y-4 py-2">
+          <p className="text-xs text-[#64748b]">
+            配置火山方舟模型接入点以启用联网搜索。<br/>
+            1. 在 <a href="https://console.volcengine.com/ark" target="_blank" className="text-orange-400">火山方舟控制台</a> 创建 API Key<br/>
+            2. 在线推理 → 创建接入点 → 选择 DeepSeek-V3.2<br/>
+            3. 复制端点 ID（ep-xxx）和 API Key 填入下方
+          </p>
+          <div>
+            <label className="text-xs text-[#94a3b8] block mb-1">API Key</label>
+            <Input value={vaKey} onChange={v => setVaKey(v as string)} placeholder="火山方舟 API Key..." />
+          </div>
+          <div>
+            <label className="text-xs text-[#94a3b8] block mb-1">端点 ID</label>
+            <Input value={vaBotId} onChange={v => setVaBotId(v as string)} placeholder="ep-20260605220808-nt2nk" />
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Tavily Dialog */}
+      <Dialog header="配置 Tavily Search API" visible={tvDlgVisible} onClose={() => setTvDlgVisible(false)} onConfirm={handleTvVerify} confirmBtn="验证并保存" cancelBtn="取消" destroyOnClose width={500}>
+        <div className="space-y-4 py-2">
+          <p className="text-xs text-[#64748b]">
+            配置 Tavily 作为备轨搜索引擎。<br/>
+            获取 API Key: <a href="https://tavily.com" target="_blank" className="text-blue-400">tavily.com</a>（免费层每月 1000 次）
+          </p>
+          <Input value={tvKey} onChange={v => setTvKey(v as string)} placeholder="tvly-xxxxxxxxxxxxxxxx" />
+        </div>
+      </Dialog>
+
+      {/* Test Search Result Dialog */}
+      <Dialog header={testResult?.title || '测试结果'} visible={testDlgVisible} onClose={() => setTestDlgVisible(false)} cancelBtn={null} confirmBtn="关闭" onConfirm={() => setTestDlgVisible(false)} destroyOnClose width={700}>
+        <div className="py-2 max-h-[60vh] overflow-y-auto">
+          <pre className="text-xs text-[#94a3b8] bg-[#0a0a0f] p-4 rounded-lg whitespace-pre-wrap break-words leading-relaxed font-mono">
+            {testResult?.content || '无结果'}
+          </pre>
         </div>
       </Dialog>
 
@@ -299,7 +487,7 @@ export default function Accounts() {
         visible={biliDlgVisible}
         onClose={() => setBiliDlgVisible(false)}
         onConfirm={handleBiliSave}
-        confirmBtn="保存"
+        confirmBtn={{ content: "保存", loading: biliSaving }}
         cancelBtn="取消"
         destroyOnClose
         width={680}

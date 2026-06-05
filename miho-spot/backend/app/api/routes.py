@@ -8,6 +8,8 @@ from sqlalchemy import func as _sql_func
 from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
+import os
 import threading
 import hashlib
 import json
@@ -788,6 +790,195 @@ async def deepseek_status():
         }
     except:
         return {"configured": True if api_key else False, "isValid": False, "message": ""}
+
+
+# ==================== Search API Keys (Volcano + Tavily) ====================
+
+def _get_search_keys():
+    """Get Volcano and Tavily keys from DB."""
+    volcano_key = ""
+    volcano_bot_id = ""
+    tavily_key = ""
+    try:
+        db = SessionLocal()
+        va = db.query(AccountModel).filter(AccountModel.platform == "volcano").first()
+        if va and va.username and va.is_valid:
+            volcano_key = va.username
+            volcano_bot_id = va.cookie or ""
+        tv = db.query(AccountModel).filter(AccountModel.platform == "tavily").first()
+        if tv and tv.username and tv.is_valid:
+            tavily_key = tv.username
+    except:
+        pass
+    finally:
+        if "db" in locals():
+            db.close()
+    return volcano_key, volcano_bot_id, tavily_key
+
+
+@router.post("/search/verify-volcano")
+async def verify_volcano(body: dict = None):
+    """Verify Volcano Ark API key + Bot ID."""
+    api_key = (body or {}).get("apiKey", "")
+    bot_id = (body or {}).get("endpointId") or (body or {}).get("botId", "")
+    if not api_key or not bot_id:
+        return {"isValid": False, "message": "请同时提供 API Key 和端点 ID"}
+
+    try:
+        import httpx
+        # Verify using chat/completions (simple ping)
+        resp = httpx.post(
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": bot_id, "messages": [{"role": "user", "content": "你好"}]},
+            timeout=15,
+        )
+        ok = resp.status_code == 200
+        if ok:
+            db = SessionLocal()
+            acc = db.query(AccountModel).filter(AccountModel.platform == "volcano").first()
+            if acc:
+                acc.username = api_key
+                acc.cookie = bot_id
+                acc.is_valid = True
+                acc.last_verified = datetime.utcnow()
+            else:
+                db.add(AccountModel(platform="volcano", username=api_key, cookie=bot_id,
+                                    is_valid=True, last_verified=datetime.utcnow()))
+            db.commit()
+            db.close()
+            return {"isValid": True, "message": "火山方舟 API 验证成功"}
+        else:
+            err_detail = ""
+            try:
+                err_body = resp.text[:300]
+                err_detail = f" - {err_body}"
+            except: pass
+            return {"isValid": False, "message": f"验证失败: HTTP {resp.status_code}{err_detail}"}
+    except Exception as e:
+        return {"isValid": False, "message": f"网络错误: {str(e)[:120]}"}
+
+
+@router.post("/search/verify-tavily")
+async def verify_tavily(body: dict = None):
+    """Verify Tavily API key."""
+    api_key = (body or {}).get("apiKey", "")
+    if not api_key:
+        return {"isValid": False, "message": "请输入 Tavily API Key"}
+
+    try:
+        import httpx
+        resp = httpx.post(
+            "https://api.tavily.com/search",
+            json={"query": "test", "api_key": api_key, "max_results": 1},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            db = SessionLocal()
+            acc = db.query(AccountModel).filter(AccountModel.platform == "tavily").first()
+            if acc:
+                acc.username = api_key
+                acc.is_valid = True
+                acc.last_verified = datetime.utcnow()
+            else:
+                db.add(AccountModel(platform="tavily", username=api_key, cookie="",
+                                    is_valid=True, last_verified=datetime.utcnow()))
+            db.commit()
+            db.close()
+            return {"isValid": True, "message": "Tavily API Key 有效"}
+        else:
+            return {"isValid": False, "message": f"验证失败: HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"isValid": False, "message": f"网络错误: {str(e)[:60]}"}
+
+
+@router.post("/search/test-volcano")
+async def test_volcano_search():
+    """执行一次真实的火山方舟搜索，返回搜索结果。用于测试配置是否正确。"""
+    volcano_key, volcano_bot_id, _ = _get_search_keys()
+    if not volcano_key or not volcano_bot_id:
+        return {"ok": False, "error": "火山方舟未配置", "results": []}
+
+    try:
+        import httpx
+        resp = httpx.post(
+            "https://ark.cn-beijing.volces.com/api/v3/responses",
+            headers={"Authorization": f"Bearer {volcano_key}", "Content-Type": "application/json"},
+            json={
+                "model": volcano_bot_id,   # 端点 ID
+                "stream": False,
+                "tools": [{"type": "web_search", "max_keyword": 3}],
+                "input": [{
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "最近有什么热点新闻"}],
+                }],
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Parse Responses API format: output[].content[].text
+            content = ""
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            content += c.get("text", "")
+            return {"ok": True, "results": [content[:2000]], "track": "volcano"}
+        elif resp.status_code == 429:
+            return {"ok": False, "error": "月免配额已用完（429），但配置有效", "results": []}
+        else:
+            err = ""
+            try: err = resp.text[:300]
+            except: pass
+            return {"ok": False, "error": f"HTTP {resp.status_code} - {err}", "results": []}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "results": []}
+
+
+@router.post("/search/test-tavily")
+async def test_tavily_search():
+    """执行一次真实的 Tavily 搜索，返回搜索结果。用于测试配置是否正确。"""
+    _, _, tavily_key = _get_search_keys()
+    if not tavily_key:
+        return {"ok": False, "error": "Tavily 未配置", "results": []}
+
+    try:
+        import httpx
+        resp = httpx.post(
+            "https://api.tavily.com/search",
+            json={"query": "今日热点新闻", "api_key": tavily_key, "max_results": 3},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            results = [
+                {"title": r.get("title", ""), "url": r.get("url", ""),
+                 "content": r.get("content", "")[:300]}
+                for r in data.get("results", [])
+            ]
+            return {"ok": True, "results": results, "track": "tavily"}
+        else:
+            return {"ok": False, "error": f"HTTP {resp.status_code}", "results": []}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "results": []}
+
+
+@router.get("/search/status")
+async def search_status():
+    """Get all search API configurations status."""
+    volcano_key, volcano_bot_id, tavily_key = _get_search_keys()
+    return {
+        "volcano": {
+            "configured": bool(volcano_key),
+            "isValid": bool(volcano_key),
+            "hasBotId": bool(volcano_bot_id),
+        },
+        "tavily": {
+            "configured": bool(tavily_key),
+            "isValid": bool(tavily_key),
+        },
+    }
 
 
 # ==================== DeepSeek Batch Analyze All ====================
@@ -4390,6 +4581,26 @@ async def pdf_report_generate(body: dict):
 
             pdf_buf = generate_pdf(saved_id, valid, db, ds_api_key=ds_key or None,
                                     progress_cb=_cb)
+
+            # Persist PDF to backend/paper/ directory
+            import os as _os
+            from datetime import datetime as _dt
+            from pathlib import Path as _Path
+            from app.models import SavedOpinionTimelineTask
+            _ot = db.query(SavedOpinionTimelineTask).filter(
+                SavedOpinionTimelineTask.id == saved_id).first()
+            _title = (_ot.title or _ot.bvid or "report") if _ot else "report"
+            # Sanitize title for filename (remove illegal chars & trailing spaces/dots)
+            _safe_title = re.sub(r'[\\/:*?"<>|\r\n]+', '_', _title)[:60].strip('. ')
+            _ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+            # Resolve backend/paper/ using absolute path from this file's location
+            _backend_dir = _Path(__file__).resolve().parent.parent.parent
+            _paper_dir = _backend_dir / 'paper'
+            _paper_dir.mkdir(parents=True, exist_ok=True)
+            _pdf_path = _paper_dir / f'{_safe_title}-{_ts}.pdf'
+            _pdf_path.write_bytes(pdf_buf.getvalue())
+            print(f'[PDF] 已保存到: {_pdf_path}', flush=True)
+
             _pdf_jobs[job_id] = {**_pdf_jobs[job_id], "status": "done",
                 "result_buf": pdf_buf, "message": "生成完成，正在下载..."}
         except Exception as e:
@@ -4446,3 +4657,378 @@ async def pdf_report_modules():
             for k, v in MODULE_LABELS.items()
         ]
     }
+
+
+# ======================================================================
+#  Agent Swiss Tournament Debate API
+# ======================================================================
+
+import asyncio as _asyncio
+from fastapi.responses import StreamingResponse
+
+_debate_sessions: dict = {}  # session_id → SwissDebateOrchestrator
+_debate_queues: dict = {}    # session_id → asyncio.Queue
+
+
+@router.post("/debate/create")
+async def debate_create(body: dict):
+    """创建辩论会话，返回 session_id。启动后台辩论引擎。"""
+    topic = body.get("topic", "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="请输入辩论主题")
+
+    ds_key = _get_deepseek_key()
+    if not ds_key:
+        raise HTTPException(status_code=400, detail="请先在账号管理中配置 DeepSeek API Key")
+
+    volcano_key, volcano_bot_id, tavily_key = _get_search_keys()
+    # Override with env vars if set
+    volcano_key = os.environ.get("VOLCANO_API_KEY") or volcano_key
+    volcano_bot_id = os.environ.get("VOLCANO_BOT_ID") or volcano_bot_id
+    tavily_key = os.environ.get("TAVILY_API_KEY") or tavily_key
+
+    session_id = _uuid.uuid4().hex[:12]
+
+    from app.debate import SwissDebateOrchestrator
+    orchestrator = SwissDebateOrchestrator(
+        topic=topic,
+        ds_api_key=ds_key,
+        volcano_key=volcano_key,
+        volcano_bot_id=volcano_bot_id,
+        tavily_key=tavily_key,
+    )
+    _debate_sessions[session_id] = orchestrator
+    _debate_queues[session_id] = _asyncio.Queue()
+
+    # 后台启动辩论
+    _threading.Thread(target=lambda: _asyncio.run(
+        _run_debate(session_id, orchestrator, _debate_queues[session_id])
+    ), daemon=True).start()
+
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "topic": topic,
+        "searchTrack": orchestrator.search_engine.current_track,
+    }
+
+
+async def _run_debate(session_id: str, orchestrator, queue: _asyncio.Queue):
+    """后台异步执行辩论"""
+    import traceback
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession
+        ds = DebateSession(
+            topic=orchestrator.topic,
+            status="running",
+            data_dir="",  # 稍后更新 — _session_dir 在 run() 内部才设置
+        )
+        db.add(ds)
+        db.commit()
+        orchestrator._db_session_id = ds.id
+    except Exception as e:
+        traceback.print_exc()
+    finally:
+        db.close()
+
+    try:
+        await orchestrator.run(queue)
+
+        # run() 完成后 _session_dir 已设置，立即更新 DB 中的 data_dir
+        if orchestrator._session_dir:
+            db2 = SessionLocal()
+            try:
+                ds2 = db2.query(DebateSession).filter(
+                    DebateSession.id == orchestrator._db_session_id
+                ).first()
+                if ds2:
+                    ds2.data_dir = str(orchestrator._session_dir)
+                    db2.commit()
+            finally:
+                db2.close()
+        await queue.put({"event": "debate_complete", "data": {"sessionId": session_id}})
+    except Exception as e:
+        traceback.print_exc()
+        await queue.put({"event": "debate_error", "data": {"error": str(e)}})
+
+
+@router.get("/debate/stream/{session_id}")
+async def debate_stream(session_id: str):
+    """SSE 实时流 —— 推送 Agent 辩论过程的逐 token 输出和结构化事件"""
+    queue = _debate_queues.get(session_id)
+    if not queue:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    async def _event_generator():
+        while True:
+            item = await queue.get()
+            yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+            if item["event"] in ("debate_complete", "debate_error"):
+                break
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/debate/confirm-facts/{session_id}")
+async def debate_confirm_facts(session_id: str, body: dict):
+    """
+    玩家确认/修改/争议/驳回事实。
+    body: {"actions": [{"fact_id": "f1", "action": "confirm", "modified_content": null}, ...]}
+    """
+    orchestrator = _debate_sessions.get(session_id)
+    if not orchestrator:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    actions = body.get("actions", [])
+    if not actions:
+        raise HTTPException(status_code=400, detail="请提供至少一个事实操作")
+
+    orchestrator.confirm_facts_batch(actions)
+    orchestrator.resume_debate()
+
+    return {"ok": True, "processed": len(actions)}
+
+
+@router.post("/debate/save/{session_id}")
+async def debate_save(session_id: str):
+    """用户手动保存辩论全量快照"""
+    orchestrator = _debate_sessions.get(session_id)
+    if not orchestrator or not orchestrator.data_exchange:
+        raise HTTPException(status_code=404, detail="会话不存在或未开始")
+
+    save_dir = orchestrator.data_exchange.save_full_session()
+
+    # 更新数据库状态
+    import traceback
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession
+        ds = db.query(DebateSession).filter(
+            DebateSession.id == getattr(orchestrator, '_db_session_id', None)
+        ).first()
+        if ds:
+            ds.status = "saved"
+            ds.current_round = orchestrator.current_round
+            ds.archive_dir = save_dir
+            # 同时确保 data_dir 被保存
+            if not ds.data_dir and orchestrator._session_dir:
+                ds.data_dir = str(orchestrator._session_dir)
+            db.commit()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        db.close()
+
+    return {"ok": True, "savedAt": save_dir}
+
+
+@router.get("/debate/sessions")
+async def debate_list_sessions():
+    """列出历史辩论会话"""
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession
+        sessions = db.query(DebateSession).order_by(
+            DebateSession.created_at.desc()
+        ).limit(20).all()
+        return {
+            "sessions": [
+                {
+                    "id": s.id,
+                    "topic": s.topic,
+                    "status": s.status,
+                    "currentRound": s.current_round,
+                    "createdAt": s.created_at.isoformat() if s.created_at else None,
+                    "completedAt": s.completed_at.isoformat() if s.completed_at else None,
+                    "dataDir": s.data_dir,
+                }
+                for s in sessions
+            ]
+        }
+    finally:
+        db.close()
+
+
+@router.get("/debate/report/{session_id}")
+async def debate_get_report(session_id: str):
+    """获取已完成辩论的最终报告"""
+    orchestrator = _debate_sessions.get(session_id)
+    if orchestrator and orchestrator.data_exchange:
+        report = orchestrator.data_exchange.load_supervisor_report()
+        if report:
+            return {"ok": True, "report": report}
+
+    # 从数据库查找
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession
+        ds = db.query(DebateSession).filter(
+            DebateSession.id == int(session_id) if session_id.isdigit() else 0
+        ).first() if session_id.isdigit() else None
+        if ds and ds.final_report:
+            return {"ok": True, "report": {"content": ds.final_report}}
+    finally:
+        db.close()
+
+    raise HTTPException(status_code=404, detail="报告不存在或辩论未完成")
+
+
+@router.get("/debate/pdf/{session_id}")
+async def debate_download_pdf(session_id: str):
+    """下载辩论 PDF 报告（内存 → DB/磁盘 二级查找）"""
+    pdf_path = None
+
+    # 优先从内存查找（正在进行的辩论）
+    orchestrator = _debate_sessions.get(session_id)
+    if orchestrator and orchestrator.data_exchange:
+        report = orchestrator.data_exchange.load_supervisor_report()
+        pdf_path = report.get("pdf_path", "")
+
+    # 回退：从 DB 查 data_dir，从磁盘 supervisor_report.json 读取 pdf_path
+    if not pdf_path or not os.path.exists(pdf_path):
+        db = SessionLocal()
+        try:
+            from app.models import DebateSession
+            ds = db.query(DebateSession).filter(
+                DebateSession.id == int(session_id) if session_id.isdigit() else 0
+            ).first() if session_id.isdigit() else None
+            if ds:
+                # 尝试从 data_dir 或 archive_dir 父目录加载
+                data_dir = Path(ds.data_dir) if ds.data_dir else None
+                if not data_dir and ds.archive_dir:
+                    archive_p = Path(ds.archive_dir)
+                    data_dir = archive_p.parent if archive_p.name == "archive" else archive_p
+                if data_dir and data_dir.exists():
+                    sr_path = data_dir / "supervisor_report.json"
+                    if sr_path.exists():
+                        sr = json.loads(sr_path.read_text(encoding="utf-8"))
+                        pdf_path = sr.get("pdf_path", "")
+        finally:
+            db.close()
+
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF 尚未生成或文件不存在")
+    return FileResponse(pdf_path, media_type="application/pdf",
+                        filename=os.path.basename(pdf_path))
+
+
+@router.get("/debate/replay/{session_id}")
+async def debate_replay(session_id: str):
+    """加载已保存辩论的完整回放数据。缺失数据不报错，返回已有内容。"""
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession
+        ds = None
+        if session_id.isdigit():
+            ds = db.query(DebateSession).filter(DebateSession.id == int(session_id)).first()
+        if not ds:
+            return {"ok": False, "error": "会话不存在", "rounds": [], "topic": ""}
+
+        rounds = []
+        fact_check = {}
+        supervisor = {}
+        pdf_path = ""
+
+        # data_dir 可能在创建时未保存（旧 bug），优先用 archive_dir 的父目录
+        data_dir = Path(ds.data_dir) if ds.data_dir else None
+        if not data_dir and ds.archive_dir:
+            # archive_dir 通常指向 debate_sessions/xxx/archive，取其父目录
+            archive_p = Path(ds.archive_dir)
+            if archive_p.name == "archive":
+                data_dir = archive_p.parent
+            else:
+                data_dir = archive_p
+
+        if data_dir and data_dir.exists():
+            archive_dir = data_dir / "archive"
+
+            # 加载事实库
+            fact_path = data_dir / "fact_check.json"
+            if fact_path.exists():
+                fact_check = json.loads(fact_path.read_text(encoding="utf-8"))
+
+            # 加载监督报告
+            sr_path = data_dir / "supervisor_report.json"
+            if sr_path.exists():
+                supervisor = json.loads(sr_path.read_text(encoding="utf-8"))
+                pdf_path = supervisor.get("pdf_path", "")
+
+            # 加载每轮输出（如果 archive 存在）
+            if archive_dir.exists():
+                for round_num in sorted([
+                    int(d.name.split('_')[1]) for d in archive_dir.iterdir()
+                    if d.is_dir() and d.name.startswith('round_')
+                ]):
+                    rd = archive_dir / f"round_{round_num:02d}"
+                    if not rd.exists():
+                        continue
+                    round_data = {"round": round_num, "agents": {}}
+                    for agent_id in ["A1", "A2", "A3", "SUPERVISOR"]:
+                        raw_file = rd / f"{agent_id.lower()}_raw_output.txt"
+                        tool_file = rd / f"{agent_id.lower()}_tool_calls.json"
+                        fact_file = rd / "fact_check_snapshot.json"
+                        summary_file = rd / "round_summary.json"
+
+                        agent_data = {}
+                        if raw_file.exists():
+                            agent_data["output"] = raw_file.read_text(encoding="utf-8")[:5000]
+                        if tool_file.exists():
+                            agent_data["tool_calls"] = json.loads(tool_file.read_text(encoding="utf-8"))
+                        if agent_id != "SUPERVISOR" or raw_file.exists():
+                            round_data["agents"][agent_id] = agent_data
+
+                    if fact_file.exists():
+                        round_data["facts_snapshot"] = json.loads(fact_file.read_text(encoding="utf-8"))
+                    if summary_file.exists():
+                        round_data["summary"] = json.loads(summary_file.read_text(encoding="utf-8"))
+                    if round_data["agents"]:
+                        rounds.append(round_data)
+
+        return {
+            "ok": True,
+            "topic": ds.topic,
+            "status": ds.status,
+            "created_at": ds.created_at.isoformat() if ds.created_at else None,
+            "rounds": rounds,
+            "fact_check": fact_check,
+            "supervisor_report": supervisor,
+            "pdf_path": pdf_path,
+        }
+    finally:
+        db.close()
+
+
+@router.delete("/debate/session/{session_id}")
+async def debate_delete_session(session_id: str):
+    """删除辩论会话"""
+    orchestrator = _debate_sessions.pop(session_id, None)
+    _debate_queues.pop(session_id, None)
+
+    import traceback
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession, DebateFact, DebateRoundSnapshot
+        if session_id.isdigit():
+            sid = int(session_id)
+            db.query(DebateRoundSnapshot).filter(
+                DebateRoundSnapshot.session_id == sid).delete()
+            db.query(DebateFact).filter(
+                DebateFact.session_id == sid).delete()
+            db.query(DebateSession).filter(
+                DebateSession.id == sid).delete()
+            db.commit()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        db.close()
+
+    return {"ok": True}

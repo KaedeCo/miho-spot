@@ -270,3 +270,45 @@ body::after {
   background-size: 200% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
 }
+
+/* ===== Agent Terminal (Debate Hall) ===== */
+@font-face {
+  font-family: 'Cascadia Code';
+  src: local('Cascadia Code'), local('CascadiaCode');
+  font-display: swap;
+}
+
+.agent-terminal {
+  background: #0a0a0a;
+  border: 1px solid #1a3a1a;
+  border-radius: 8px;
+  font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #00ff41;
+  padding: 14px;
+  overflow-y: auto;
+  word-break: break-word;
+}
+
+.agent-terminal .tool-call {
+  color: #6b7280;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.agent-terminal .thinking {
+  color: #9ca3af;
+  font-style: italic;
+}
+
+.agent-terminal .cursor-blink {
+  animation: blink-cursor 1s step-end infinite;
+  color: #00ff41;
+  font-weight: bold;
+}
+
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

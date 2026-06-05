@@ -2,11 +2,51 @@
 
 > "从此以后，每个人都是社管，亦或者都不是社管。" — By Chronostasis
 
-**v1.4**
+**v1.5**
 
 Miho-spot 是一个多平台二游圈舆情监测与分析系统，覆盖知乎、抖音、贴吧、B站等平台。通过热搜爬取、关键词匹配、SnowNLP 本地情感分析、DeepSeek AI 增强分析，实时追踪米哈游相关舆论风向。
 
-Miho-Spot V1.3 是一个真正意义上的"生产级"里程碑。从今天起，一个研究者可以完全依赖 Miho-spot 完成从数据采集、清洗、分析到报告生成的全过程，无需任何外部工具。至此，Miho-spot 从一个"数据展示工具"进化为一个面向舆情研究者的全链路分析平台——从热搜监测、用户画像、视频评论挖掘，到三维舆论地形、词云、AI 深度报告，全部打通！
+**v1.5 核心突破**：多Agent瑞士轮辩论厅 — 三个专业化AI Agent（私有数据 + 官媒 + 公域）通过8轮结构化辩论（立论→驳论→防守→策展→监督整理）探索舆情问题的多维度真相，配备双轨搜索引擎（火山方舟+Tavily）、实时SSE流式输出、用户事实确认交互、以及完整辩论回放与PDF报告生成。
+
+### v1.5 更新重点（2026-06-06）— 多Agent瑞士轮辩论厅
+
+v1.5 引入了 Miho-spot 最具野心的功能：一个基于 DeepSeek API 的三Agent瑞士轮辩论引擎，配合火山方舟+Tavily双轨联网搜索。
+
+#### 辩论系统架构
+
+三个专业化Agent在8轮结构化辩论中交替发言（立论→驳论→防守→策展→监督整理），通过JSON文件交换论据：
+
+- **A1 私有数据专家** — 检索 `paper/` 目录下的PDF报告，提取非公开数据
+- **A2 官媒分析专家** — 通过火山方舟/Tavily搜索引擎抓取官方媒体报道
+- **A3 公域扫描专家** — 搜索B站/知乎/小红书/贴吧等公共论坛的民间讨论
+- **监督Agent** — 第7轮策展整合，第8轮生成结构化最终报告
+
+**双轨搜索引擎**：火山方舟 Ark Bot（月免费2万次，`/api/v3/responses` web_search tool）为主力，Tavily自动Fallback。前端"账号管理"页面独立配置验证。
+
+**Two-Pass智能体架构**（核心技术突破）：Pass1 `tool_choice:"required"` 强制搜索收集 → Pass2 移除工具注入搜索上下文，专注分析写作。从根本上解决了Agent"只搜索不分析"的问题。
+
+#### 用户交互
+
+- **事实确认面板**：辩论过程中实时推送提取的关键事实，支持确认/争议/驳回/修改四种操作
+- **实时辩论终端**：三个黑色Cascadia Code终端面板，SSE流式推送，颜色编码（蓝色=辩论/灰色=工具/紫色=文件/绿色=事实）
+- **辩论回放**（`/debate-replay`）：竖向时间轴+彩色发言者横栏+react-markdown渲染+PDF下载
+
+#### 健壮性设计
+
+- 每轮独立try/except，单轮失败不中断辩论
+- 发生错误自动保存不完整结果
+- PDF生成采用reportlab（与已有paper/输出一致），支持SimSun中文字体
+- 事实提取三步质量过滤（标记格式→搜索摘要→自然段合并，最小40字符+去重）
+- 监督报告max_tokens参数化（分析4000/监督6000），防止截断
+- data_dir DB持久化+archive_dir回退，确保后端重启后辩论回放正常
+
+#### 新增代码
+
+- **`backend/app/debate/` 模块**（2003行）：orchestrator(1089行) + agents(203行) + prompts(236行) + search_tools(221行) + data_exchange(243行)
+- **3个SQLAlchemy模型**：DebateSession + DebateFact + DebateRoundSnapshot
+- **7个API路由**：create/SSE流/事实确认/保存/会话列表/报告/回放/PDF/删除
+- **6个前端组件/页面**：DebateHall(298行) + DebateReplay(200行) + AgentTerminal + DebateProgress + FactConfirmPanel + DebateReportPreview
+- **Accounts页**：火山方舟+Tavily配置卡片（含验证+测试搜索按钮）
 
 ### v1.3 更新重点（2026-06-03）：舆情监测全栈稳定性修复与数据流完善
 
@@ -299,6 +339,11 @@ flowchart TD
 | Three.js | [v1.3] 3D 热力图渲染 |
 | IDW 插值 | [v1.3] 反距离加权空间插值 |
 | 凝聚聚类 | [v1.4] 加权层次聚类算法 |
+| Volcano Ark API | [v1.5] 联网搜索引擎（主，月免费2万次） |
+| Tavily API | [v1.5] 联网搜索引擎（备，自动Fallback） |
+| react-markdown | [v1.5] 前端Markdown渲染 |
+| SSE (Server-Sent Events) | [v1.5] 辩论实时流式传输 |
+| Cascadia Code | [v1.5] Agent终端等宽字体 |
 
 ---
 
@@ -351,7 +396,9 @@ miho-spot/
 │       │   ├── WordCloud.tsx     # [v1.3] 词云生成器
 │       │   ├── DeepAnalysis.tsx  # [v1.3] 深度分析（话题探索）
 │       │   ├── OpinionTimeline.tsx # [v1.4] 舆情推演（时间序列+二维热力图）
-│       │   └── ClusterAnalysis.tsx # [v1.4] 聚类分群（加权聚类+群体画像）
+│       │   ├── ClusterAnalysis.tsx # [v1.4] 聚类分群（加权聚类+群体画像）
+│       │   ├── DebateHall.tsx    # [v1.5] 辩论大厅（三终端+SSE流+事实确认）
+│       │   └── DebateReplay.tsx  # [v1.5] 辩论回放（竖向时间轴）
 │       ├── services/api.ts       # API 调用层
 │       └── types/index.ts        # TypeScript 类型定义
 ├── backend/                      # Python 后端
@@ -362,6 +409,12 @@ miho-spot/
 │       ├── crawlers/__init__.py  # 爬虫引擎（知乎/抖音/贴吧/Tophub）
 │       ├── sentiment/__init__.py # 情感分析（关键词匹配 + SnowNLP）
 │       ├── models/__init__.py    # SQLAlchemy 模型（含自动迁移）
+│       ├── debate/               # [v1.5] 多Agent瑞士轮辩论引擎
+│       │   ├── orchestrator.py   # 瑞士轮调度 + Two-Pass调用 + SSE事件
+│       │   ├── agents.py         # BaseAgent + A1/A2/A3/SUPERVISOR
+│       │   ├── prompts.py        # 辩论阶段提示词模板
+│       │   ├── search_tools.py   # 双轨搜索引擎（火山方舟+Tavily）
+│       │   └── data_exchange.py  # JSON文件I/O + 事实交换协议
 │       ├── pdf_report.py         # [v1.4] PDF报告生成引擎（九大模块+论文格式）
 │       ├── monitor.py            # PyQt6 监控面板
 │       └── gui/main_window.py    # PyQt6 桌面窗口
@@ -404,6 +457,20 @@ miho-spot/
 | `/api/pdf-report/generate` | POST | [v1.4] 启动 PDF 生成（返回 jobId） |
 | `/api/pdf-report/progress/{jobId}` | GET | [v1.4] 轮询生成进度 |
 | `/api/pdf-report/download/{jobId}` | GET | [v1.4] 下载完成的 PDF |
+| `/api/debate/create` | POST | [v1.5] 创建辩论会话，启动后台Agent |
+| `/api/debate/stream/{id}` | GET | [v1.5] SSE 实时流（Agent逐token输出） |
+| `/api/debate/confirm-facts/{id}` | POST | [v1.5] 用户确认/修改/争议/驳回事实 |
+| `/api/debate/save/{id}` | POST | [v1.5] 保存辩论全量快照 |
+| `/api/debate/sessions` | GET | [v1.5] 列出所有辩论会话 |
+| `/api/debate/report/{id}` | GET | [v1.5] 获取最终报告 |
+| `/api/debate/replay/{id}` | GET | [v1.5] 加载完整回放数据（时间轴） |
+| `/api/debate/pdf/{id}` | GET | [v1.5] 下载辩论PDF报告 |
+| `/api/debate/session/{id}` | DELETE | [v1.5] 删除辩论会话 |
+| `/api/search/verify-volcano` | POST | [v1.5] 验证火山方舟API配置 |
+| `/api/search/verify-tavily` | POST | [v1.5] 验证Tavily API配置 |
+| `/api/search/status` | GET | [v1.5] 获取搜索引擎状态 |
+| `/api/search/test-volcano` | POST | [v1.5] 测试火山方舟联网搜索 |
+| `/api/search/test-tavily` | POST | [v1.5] 测试Tavily联网搜索 |
 
 ---
 
@@ -430,6 +497,18 @@ miho-spot/
 ---
 
 ## 更新日志
+
+### v1.5 (2026-06-06) — 多Agent瑞士轮辩论厅
+
+**辩论系统**：三个专业化AI Agent（私有数据/官媒/公域）通过8轮结构化辩论（立论→驳论→防守→策展→监督整理）探索舆情真相。双轨搜索引擎（火山方舟+Tavily）自动切换。Two-Pass架构解决Agent只搜索不分析问题。
+
+**用户交互**：事实确认面板（确认/争议/驳回/修改）、三终端SSE实时流（Cascadia Code字体+颜色编码）、辩论回放竖向时间轴+PDF下载。
+
+**后端**：`debate/` 模块（2003行）+ 3个SQLAlchemy模型 + 10个API路由。Accounts页新增火山方舟/Tavily配置验证。
+
+**Bug修复**：data_dir持久化、PDF下载DB回退、监督报告截断、React重复Key等7项。
+
+详见 [release_notes_v1.5.md](release_notes_v1.5.md)
 
 ### v1.4 (2026-06-04) — 聚类分群 + PDF报告定制 + 全链路体验升级
 
