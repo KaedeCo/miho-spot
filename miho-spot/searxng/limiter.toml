@@ -1,0 +1,14 @@
+# Disable rate limiting for localhost usage
+[botdetection.ip_limit]
+link_token = false
+
+[botdetection.ip_lists]
+pass_ip = [
+  "127.0.0.1",
+  "::1",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+]
+
+[botdetection.link_token]
+enabled = false

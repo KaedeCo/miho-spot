@@ -151,7 +151,9 @@ class BaseAgent:
         if topic:
             prompt = f"本次辩论主题：{topic}\n\n" + prompt
 
-        prompt += "\n\n重要提醒：始终以 JSON 结构化格式组织你的论点，便于后续处理。"
+        # 监督阶段不要求 JSON，直接输出报告正文
+        if stage != "supervise":
+            prompt += "\n\n重要提醒：始终以 JSON 结构化格式组织你的论点，便于后续处理。"
         return prompt
 
 
@@ -188,7 +190,7 @@ class SupervisorAgent(BaseAgent):
     agent_id = "SUPERVISOR"
     personality = "公正的舆情监督分析员"
     system_prompt = SUPERVISOR_SYSTEM
-    tool_schemas = [TOOL_SCHEMAS["search_web"]]
+    tool_schemas = []  # 监督 Agent 不搜索，直接整合已有数据
 
 
 # ── Agent 工厂 ────────────────────────────────────────────

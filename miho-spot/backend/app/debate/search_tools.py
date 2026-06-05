@@ -1,102 +1,121 @@
 """
-双轨制搜索引擎 + 各 Agent 专用搜索工具
+三轨搜索引擎 + Agent 专用搜索工具
 
-主轨：火山方舟 Bot 插件（月免 2 万次）
-备轨：Tavily Search API（月免 1000 次）
-A1：私有数据 —— 本地 paper/ 目录 PDF 检索（不走搜索引擎）
+主力：DuckDuckGo (ddgs) — 免费无限，纯搜索不消耗 LLM Token
+备轨1：Tavily        — 月免 1000 次，结构化结果
+备轨2：Serper.dev    — 2500 次免费，Google 品质
+A1：私有数据         — 本地 paper/ 目录 PDF 检索（不走搜索引擎）
 """
 
-import asyncio
-import httpx
-import json
+import os
 from pathlib import Path
 from typing import Optional
 
+import httpx
+
 
 class QuotaExhaustedError(Exception):
-    """火山方舟月免配额耗尽"""
     pass
 
 
 class SearchEngine:
-    """
-    双轨制搜索引擎。优先使用火山方舟 Bot，配额耗尽自动切 Tavily。
-    """
+    """三轨制搜索引擎。自动降级：DDGS → Tavily → Serper。"""
 
     def __init__(self, volcano_key: str = None, volcano_bot_id: str = None,
-                 tavily_key: str = None):
-        self.volcano_key = volcano_key
-        self.volcano_bot_id = volcano_bot_id
+                 tavily_key: str = None, serper_key: str = None):
         self.tavily_key = tavily_key
-        self.volcano_available = bool(volcano_key and volcano_bot_id)
-        self.tavily_available = bool(tavily_key)
-        self._volcano_call_count = 0
-        self._tavily_call_count = 0
+        self.serper_key = serper_key or os.environ.get("SERPER_API_KEY", "")
+
+        self._ddgs_available = True
+        self._tavily_available = bool(tavily_key)
+        self._serper_available = bool(self.serper_key)
+
+        self._ddgs_calls = 0
+        self._tavily_calls = 0
+        self._serper_calls = 0
 
     @property
     def current_track(self) -> str:
-        return "volcano" if self.volcano_available else "tavily"
+        if self._ddgs_available:
+            return "ddgs"
+        if self._tavily_available:
+            return "tavily"
+        if self._serper_available:
+            return "serper"
+        return "none"
 
     @property
     def stats(self) -> dict:
         return {
             "current_track": self.current_track,
-            "volcano_calls": self._volcano_call_count,
-            "tavily_calls": self._tavily_call_count,
+            "ddgs_calls": self._ddgs_calls,
+            "tavily_calls": self._tavily_calls,
+            "serper_calls": self._serper_calls,
         }
 
     async def search(self, query: str,
                      include_domains: list = None,
                      exclude_domains: list = None) -> dict:
-        """
-        统一搜索入口，自动选择可用轨道。
-        返回 {"results": [...], "track": "volcano"|"tavily", "raw": ...}
-        """
-        if self.volcano_available:
+        """统一搜索入口，三轨自动降级"""
+        # Track 1: DuckDuckGo
+        if self._ddgs_available:
             try:
-                result = await self._search_volcano(query)
-                self._volcano_call_count += 1
-                return {"results": result, "track": "volcano", "raw": None}
-            except QuotaExhaustedError:
-                self.volcano_available = False
+                result = await self._search_ddgs(query)
+                self._ddgs_calls += 1
+                return {"results": result, "track": "ddgs", "raw": None}
+            except Exception:
+                self._ddgs_available = False
 
-        if self.tavily_available:
-            result = await self._search_tavily(
-                query, include_domains, exclude_domains)
-            self._tavily_call_count += 1
-            return {"results": result, "track": "tavily", "raw": None}
+        # Track 2: Tavily
+        if self._tavily_available:
+            try:
+                result = await self._search_tavily(query, include_domains, exclude_domains)
+                self._tavily_calls += 1
+                return {"results": result, "track": "tavily", "raw": None}
+            except Exception:
+                self._tavily_available = False
+
+        # Track 3: Serper.dev
+        if self._serper_available:
+            try:
+                result = await self._search_serper(query)
+                self._serper_calls += 1
+                return {"results": result, "track": "serper", "raw": None}
+            except Exception:
+                self._serper_available = False
 
         return {"results": [], "track": "none", "raw": None}
 
-    async def _search_volcano(self, query: str) -> list:
-        """火山方舟端点 + web_search 工具搜索"""
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
-            resp = await client.post(
-                "https://ark.cn-beijing.volces.com/api/v3/responses",
-                headers={
-                    "Authorization": f"Bearer {self.volcano_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.volcano_bot_id,   # 端点 ID，如 ep-20260605220808-nt2nk
-                    "stream": False,
-                    "tools": [{"type": "web_search", "max_keyword": 3}],
-                    "input": [{
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": query}],
-                    }],
-                },
-                timeout=60,
-            )
-            if resp.status_code == 429:
+    # ── DDGS ────────────────────────────────────────────
+
+    async def _search_ddgs(self, query: str, max_results: int = 5) -> list:
+        """DuckDuckGo 即时搜索（纯搜索，零 Token）"""
+        import asyncio as _asyncio
+        from ddgs import DDGS
+
+        def _sync():
+            results = []
+            try:
+                with DDGS() as ddgs:
+                    for r in ddgs.text(query, max_results=max_results):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "content": r.get("body", ""),
+                            "url": r.get("href", ""),
+                            "source": "ddgs",
+                        })
+            except Exception:
                 raise QuotaExhaustedError()
-            data = resp.json()
-            return self._parse_volcano_results(data)
+            return results
+
+        loop = _asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _sync)
+
+    # ── Tavily ──────────────────────────────────────────
 
     async def _search_tavily(self, query: str,
                              include_domains: list = None,
                              exclude_domains: list = None) -> list:
-        """Tavily Search API"""
         body = {
             "query": query,
             "api_key": self.tavily_key,
@@ -111,40 +130,9 @@ class SearchEngine:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://api.tavily.com/search",
-                json=body,
-                timeout=30,
-            )
+                json=body, timeout=30)
             data = resp.json()
-            return self._parse_tavily_results(data)
 
-    @staticmethod
-    def _parse_volcano_results(data: dict) -> list:
-        """解析火山方舟 Responses API 返回（含 web_search 结果）"""
-        results = []
-        # Extract assistant message text
-        output = data.get("output", [])
-        for item in output:
-            if item.get("type") == "message" and item.get("role") == "assistant":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        results.append({
-                            "title": "火山方舟搜索",
-                            "content": c.get("text", "")[:3000],
-                            "url": "",
-                            "source": "volcano",
-                        })
-        if not results:
-            results.append({
-                "title": "无结果",
-                "content": str(data)[:500],
-                "url": "",
-                "source": "volcano",
-            })
-        return results
-
-    @staticmethod
-    def _parse_tavily_results(data: dict) -> list:
-        """解析 Tavily 返回"""
         results = []
         for r in data.get("results", []):
             results.append({
@@ -155,16 +143,39 @@ class SearchEngine:
             })
         return results
 
+    # ── Serper.dev ──────────────────────────────────────
+
+    async def _search_serper(self, query: str) -> list:
+        """Serper.dev Google 搜索（2500 次免费）"""
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": self.serper_key,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "num": 5, "gl": "cn", "hl": "zh-cn"},
+                timeout=20,
+            )
+            data = resp.json()
+
+        results = []
+        for r in data.get("organic", []):
+            results.append({
+                "title": r.get("title", ""),
+                "content": r.get("snippet", ""),
+                "url": r.get("link", ""),
+                "source": "serper",
+            })
+        return results
+
 
 # ======================================================================
 #  Agent 专用搜索函数
 # ======================================================================
 
 async def search_private_reports(keywords: str) -> dict:
-    """
-    A1 专用：扫描 backend/paper/*.pdf，关键词匹配检索。
-    不经过搜索引擎，纯本地操作。
-    """
+    """A1 专用：扫描 backend/paper/*.pdf，关键词匹配检索"""
     paper_dir = Path(__file__).resolve().parent.parent.parent / "paper"
     result_text = []
     files_found = []
@@ -172,11 +183,10 @@ async def search_private_reports(keywords: str) -> dict:
     if paper_dir.exists():
         for pdf_file in sorted(paper_dir.glob("*.pdf")):
             filename = pdf_file.stem
-            # 简单关键词匹配（文件名 + 大小信息）
             kw_list = [k.strip() for k in keywords.replace("，", ",").split(",") if k.strip()]
             matched = any(kw.lower() in filename.lower() for kw in kw_list)
 
-            if matched or not kw_list:  # 无关键词则返回所有
+            if matched or not kw_list:
                 size_kb = pdf_file.stat().st_size / 1024
                 result_text.append(
                     f"标题：{filename}\n"

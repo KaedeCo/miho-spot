@@ -44,13 +44,15 @@ class SwissDebateOrchestrator:
 
     def __init__(self, topic: str, ds_api_key: str,
                  volcano_key: str = None, volcano_bot_id: str = None,
-                 tavily_key: str = None, base_dir: Path = None):
+                 tavily_key: str = None, serper_key: str = None,
+                 base_dir: Path = None):
         self.topic = topic
         self.ds_api_key = ds_api_key
         self.search_engine = SearchEngine(
             volcano_key=volcano_key,
             volcano_bot_id=volcano_bot_id,
             tavily_key=tavily_key,
+            serper_key=serper_key,
         )
         self.agents = create_agents(self.search_engine)
         self._base_dir = base_dir or Path(__file__).resolve().parent.parent.parent
@@ -432,7 +434,10 @@ class SwissDebateOrchestrator:
         current_messages = list(messages)
         tool_call_count = 0
 
-        while tool_call_count < max_tool_calls:
+        # 第一轮始终执行（即使 max_tool_calls=0，分析阶段至少跑一次）
+        max_loops = max_tool_calls + 1  # +1 为首次分析 passes
+        for loop_idx in range(max_loops):
+            is_first_pass = (loop_idx == 0)
             await self._push_event(event_queue, "agent_thinking", {
                 "agent": agent_id,
                 "message": "正在思考..." if tool_call_count == 0 else "正在调用工具...",
@@ -634,7 +639,7 @@ class SwissDebateOrchestrator:
 
         raw_output = await self._call_deepseek_streaming(
             agent, messages, event_queue, "SUPERVISOR",
-            max_tool_calls=2, max_tokens=6000)
+            max_tool_calls=0, max_tokens=8000)  # 无工具、大 token，专注写报告
 
         # 保存监督报告（PDF 路径稍后在 run() 中更新）
         self.data_exchange.save_supervisor_report({

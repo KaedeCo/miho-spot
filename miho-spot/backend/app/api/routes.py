@@ -795,10 +795,11 @@ async def deepseek_status():
 # ==================== Search API Keys (Volcano + Tavily) ====================
 
 def _get_search_keys():
-    """Get Volcano and Tavily keys from DB."""
+    """Get Volcano, Tavily, and Serper keys from DB."""
     volcano_key = ""
     volcano_bot_id = ""
     tavily_key = ""
+    serper_key = ""
     try:
         db = SessionLocal()
         va = db.query(AccountModel).filter(AccountModel.platform == "volcano").first()
@@ -808,12 +809,15 @@ def _get_search_keys():
         tv = db.query(AccountModel).filter(AccountModel.platform == "tavily").first()
         if tv and tv.username and tv.is_valid:
             tavily_key = tv.username
+        sp = db.query(AccountModel).filter(AccountModel.platform == "serper").first()
+        if sp and sp.username and sp.is_valid:
+            serper_key = sp.username
     except:
         pass
     finally:
         if "db" in locals():
             db.close()
-    return volcano_key, volcano_bot_id, tavily_key
+    return volcano_key, volcano_bot_id, tavily_key, serper_key
 
 
 @router.post("/search/verify-volcano")
@@ -895,7 +899,7 @@ async def verify_tavily(body: dict = None):
 @router.post("/search/test-volcano")
 async def test_volcano_search():
     """执行一次真实的火山方舟搜索，返回搜索结果。用于测试配置是否正确。"""
-    volcano_key, volcano_bot_id, _ = _get_search_keys()
+    volcano_key, volcano_bot_id, *_ = _get_search_keys()
     if not volcano_key or not volcano_bot_id:
         return {"ok": False, "error": "火山方舟未配置", "results": []}
 
@@ -939,7 +943,7 @@ async def test_volcano_search():
 @router.post("/search/test-tavily")
 async def test_tavily_search():
     """执行一次真实的 Tavily 搜索，返回搜索结果。用于测试配置是否正确。"""
-    _, _, tavily_key = _get_search_keys()
+    _, _, tavily_key, _ = _get_search_keys()
     if not tavily_key:
         return {"ok": False, "error": "Tavily 未配置", "results": []}
 
@@ -967,7 +971,7 @@ async def test_tavily_search():
 @router.get("/search/status")
 async def search_status():
     """Get all search API configurations status."""
-    volcano_key, volcano_bot_id, tavily_key = _get_search_keys()
+    volcano_key, volcano_bot_id, tavily_key, serper_key = _get_search_keys()
     return {
         "volcano": {
             "configured": bool(volcano_key),
@@ -977,6 +981,10 @@ async def search_status():
         "tavily": {
             "configured": bool(tavily_key),
             "isValid": bool(tavily_key),
+        },
+        "serper": {
+            "configured": bool(serper_key),
+            "isValid": bool(serper_key),
         },
     }
 
@@ -4681,11 +4689,12 @@ async def debate_create(body: dict):
     if not ds_key:
         raise HTTPException(status_code=400, detail="请先在账号管理中配置 DeepSeek API Key")
 
-    volcano_key, volcano_bot_id, tavily_key = _get_search_keys()
+    volcano_key, volcano_bot_id, tavily_key, serper_key = _get_search_keys()
     # Override with env vars if set
     volcano_key = os.environ.get("VOLCANO_API_KEY") or volcano_key
     volcano_bot_id = os.environ.get("VOLCANO_BOT_ID") or volcano_bot_id
     tavily_key = os.environ.get("TAVILY_API_KEY") or tavily_key
+    serper_key = os.environ.get("SERPER_API_KEY") or serper_key
 
     session_id = _uuid.uuid4().hex[:12]
 
@@ -4696,6 +4705,7 @@ async def debate_create(body: dict):
         volcano_key=volcano_key,
         volcano_bot_id=volcano_bot_id,
         tavily_key=tavily_key,
+        serper_key=serper_key,
     )
     _debate_sessions[session_id] = orchestrator
     _debate_queues[session_id] = _asyncio.Queue()
