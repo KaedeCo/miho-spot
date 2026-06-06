@@ -39,7 +39,62 @@ export default function ClusterAnalysisPage() {
   const [zoom, setZoom] = useState(1);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Comment enhancer presets (localStorage + backend DB 双持久化)
+  const [showCommentEnhancer, setShowCommentEnhancer] = useState(false);
+  const [ceStyle, setCeStyle] = useState(() => localStorage.getItem("miho_ce_style") || "理性");
+  const [ceStance, setCeStance] = useState(() => localStorage.getItem("miho_ce_stance") || "挺米");
+  const [ce诉求, setCe诉求] = useState(() => localStorage.getItem("miho_ce_su") || "");
+  const [downloading, setDownloading] = useState(false);
+
   useEffect(() => { loadSavedList(); }, []);
+  useEffect(() => {
+    // 从后端恢复 presets（覆盖 localStorage 初始值）
+    fetch("/api/comment/presets")
+      .then(r => r.json())
+      .then(d => {
+        if (d.style) { setCeStyle(d.style); localStorage.setItem("miho_ce_style", d.style); }
+        if (d.stance) { setCeStance(d.stance); localStorage.setItem("miho_ce_stance", d.stance); }
+        if (d.诉求) { setCe诉求(d.诉求); localStorage.setItem("miho_ce_su", d.诉求); }
+      })
+      .catch(() => {});
+  }, []);
+
+  // 修改时同步保存到 localStorage + 后端
+  useEffect(() => { localStorage.setItem("miho_ce_style", ceStyle); }, [ceStyle]);
+  useEffect(() => { localStorage.setItem("miho_ce_stance", ceStance); }, [ceStance]);
+  useEffect(() => { localStorage.setItem("miho_ce_su", ce诉求); }, [ce诉求]);
+  const syncPresetsToBackend = async () => {
+    try {
+      await fetch("/api/comment/presets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style: ceStyle, stance: ceStance, 诉求: ce诉求 }),
+      });
+    } catch {}
+  };
+  useEffect(() => { syncPresetsToBackend(); }, [ceStyle, ceStance, ce诉求]);
+
+  const handleDownloadScript = async () => {
+    setDownloading(true);
+    try {
+      // 先确保最新 preset 已同步到后端
+      await fetch("/api/comment/presets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style: ceStyle, stance: ceStance, 诉求: ce诉求 }),
+      });
+      const resp = await fetch("/api/comment/script");
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'miho-spot-comment-enhancer.user.js';
+      a.click();
+      URL.revokeObjectURL(url);
+      MessagePlugin.success("脚本已下载！请按安装教程导入浏览器");
+    } catch { MessagePlugin.error("下载失败"); }
+    setDownloading(false);
+  };
 
   const loadSavedList = async () => {
     try { const r = await otListSaved(); setSavedList(r.items || []); } catch { }
@@ -316,6 +371,63 @@ export default function ClusterAnalysisPage() {
             </span>
           </div>
         )}
+
+        {/* 评论增强面板 */}
+        <div className="glass-card p-4 space-y-3">
+          <div className="flex items-center justify-between cursor-pointer" onClick={() => setShowCommentEnhancer(!showCommentEnhancer)}>
+            <div className="flex items-center gap-2">
+              <span className="text-white font-semibold">💬 评论增强（B站话术生成）</span>
+              <Tag theme="warning" variant="light" size="small">需油猴脚本</Tag>
+            </div>
+            <span className="text-[#64748b] text-xs">{showCommentEnhancer ? "▲" : "▼"}</span>
+          </div>
+
+          {showCommentEnhancer && (
+            <>
+              <div className="text-xs text-[#64748b] leading-relaxed">
+                下载油猴脚本后，打开任意B站视频页面，脚本将自动为评论区每条评论标注立场标签（挺米/反米）和风格标签（理性/感性）。选中评论后可一键生成 DeepSeek 话术并填入回复框。
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-[#94a3b8] mb-1 block">话术风格</label>
+                  <select value={ceStyle} onChange={e => setCeStyle(e.target.value)}
+                    className="w-full bg-[#0a0a0f] border border-[#2a2a4a] rounded px-2 py-1.5 text-sm text-[#e0e0e0]">
+                    <option value="理性">理性分析</option>
+                    <option value="感性">情感共鸣</option>
+                    <option value="幽默">幽默反击</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-[#94a3b8] mb-1 block">立场倾向</label>
+                  <select value={ceStance} onChange={e => setCeStance(e.target.value)}
+                    className="w-full bg-[#0a0a0f] border border-[#2a2a4a] rounded px-2 py-1.5 text-sm text-[#e0e0e0]">
+                    <option value="挺米">挺米</option>
+                    <option value="反米">反米</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-[#94a3b8] mb-1 block">自定义诉求（选填）</label>
+                <input type="text" value={ce诉求} onChange={e => setCe诉求(e.target.value)}
+                  placeholder="例如：反驳关于玛薇卡服装设计的观点"
+                  className="w-full bg-[#0a0a0f] border border-[#2a2a4a] rounded px-2 py-1.5 text-sm text-[#e0e0e0] placeholder:text-[#555]" />
+              </div>
+
+              <div className="flex gap-3">
+                <Button theme="primary" onClick={handleDownloadScript} loading={downloading}>
+                  📥 下载油猴脚本
+                </Button>
+                <Button variant="outline" onClick={() => {
+                  MessagePlugin.info("安装方法：\n1. 浏览器安装 Tampermonkey 扩展\n2. 打开 Tampermonkey 管理面板\n3. 拖入下载的 .user.js 文件\n4. 打开任意 B站视频页面即可");
+                }}>
+                  📖 安装教程
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
 
         {/* Heatmap */}
         {result?.heatmapGrid && (

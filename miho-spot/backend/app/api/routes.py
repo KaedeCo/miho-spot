@@ -4931,6 +4931,52 @@ async def debate_download_pdf(session_id: str):
                         filename=os.path.basename(pdf_path))
 
 
+@router.post("/debate/regenerate-pdf/{session_id}")
+async def debate_regenerate_pdf(session_id: str):
+    """使用最新 PDF 渲染引擎重新生成已保存辩论的 PDF 报告"""
+    db = SessionLocal()
+    try:
+        from app.models import DebateSession
+        ds = db.query(DebateSession).filter(
+            DebateSession.id == int(session_id) if session_id.isdigit() else 0
+        ).first() if session_id.isdigit() else None
+        if not ds:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        data_dir = Path(ds.data_dir) if ds.data_dir else None
+        if not data_dir and ds.archive_dir:
+            archive_p = Path(ds.archive_dir)
+            data_dir = archive_p.parent if archive_p.name == "archive" else archive_p
+        if not data_dir or not data_dir.exists():
+            raise HTTPException(status_code=404, detail="会话数据目录不存在")
+
+        sr_path = data_dir / "supervisor_report.json"
+        if not sr_path.exists():
+            raise HTTPException(status_code=404, detail="监督报告不存在，无法生成 PDF")
+
+        # 构造临时 orchestrator 来复用 generate_pdf()
+        from app.debate import SwissDebateOrchestrator
+        from app.debate.data_exchange import DataExchange
+
+        orchestrator = SwissDebateOrchestrator.__new__(SwissDebateOrchestrator)
+        orchestrator.topic = ds.topic
+        orchestrator._base_dir = Path(__file__).resolve().parent.parent.parent
+        orchestrator._session_dir = data_dir
+        orchestrator.data_exchange = DataExchange(data_dir)
+        orchestrator.current_round = ds.current_round
+
+        pdf_path = orchestrator.generate_pdf()
+
+        # 更新 supervisor_report.json 中的 pdf_path
+        sr = json.loads(sr_path.read_text(encoding="utf-8"))
+        sr["pdf_path"] = pdf_path
+        sr_path.write_text(json.dumps(sr, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return {"ok": True, "pdf_path": pdf_path, "session_id": session_id}
+    finally:
+        db.close()
+
+
 @router.get("/debate/replay/{session_id}")
 async def debate_replay(session_id: str):
     """加载已保存辩论的完整回放数据。缺失数据不报错，返回已有内容。"""
@@ -5042,3 +5088,225 @@ async def debate_delete_session(session_id: str):
         db.close()
 
     return {"ok": True}
+
+
+# ======================================================================
+#  B站评论增强 — 油猴脚本 + 后端分析引擎
+# ======================================================================
+
+@router.get("/comment/script")
+async def comment_download_script():
+    """下载定制的 B站评论增强油猴脚本（默认值从 DB 历史 preset 读取）"""
+    template_path = Path(__file__).resolve().parent.parent / "debate" / "comment_script_template.js"
+    if not template_path.exists():
+        raise HTTPException(status_code=500, detail="脚本模板文件不存在")
+    # 如果前端没传参数，用 DB 保存的历史 preset 作为默认值
+    saved = _load_comment_presets()
+    template = template_path.read_text(encoding="utf-8")
+    api_base = "http://localhost:8000/api"
+    script = (template
+              .replace("%%STYLE%%", saved.get("style", "理性"))
+              .replace("%%STANCE%%", saved.get("stance", "挺米"))
+              .replace("%%诉求%%", saved.get("诉求", ""))
+              .replace("%%API_BASE%%", api_base))
+    return Response(
+        content=script,
+        media_type="application/javascript",
+        headers={"Content-Disposition": "attachment; filename=miho-spot-comment-enhancer.user.js"},
+    )
+
+
+@router.post("/comment/analyze")
+async def comment_analyze_batch(body: dict):
+    """
+    B站评论批量 NLP 分类（本地，零 Token 消耗）。
+    输入: {"comments": [{"text": "..."}, ...]}
+    输出: {"results": [{"stance": "pro|anti|neutral", "emotion": "rational|emotional|neutral"}, ...]}
+    """
+    from app.sentiment import _load_keywords
+
+    comments = body.get("comments", [])
+    if not comments:
+        return {"results": []}
+
+    keywords = _load_keywords()
+    results = []
+
+    for item in comments:
+        text = item.get("text", "").strip()
+        if not text:
+            results.append({"stance": "neutral", "emotion": "neutral"})
+            continue
+
+        # 关键词匹配
+        matched = []
+        for kw, cat in keywords.items():
+            if kw.lower() in text.lower():
+                matched.append((kw, cat))
+
+        # 立场判断
+        if not matched:
+            stance = "neutral"
+        else:
+            # 检查是否有米哈游相关关键词
+            mhy_matches = [m for m in matched
+                          if m[1] in ("mihoyo_game", "mihoyo_character", "general")]
+            comp_matches = [m for m in matched if m[1] == "competitor"]
+            if mhy_matches:
+                stance = "pro"
+            elif comp_matches:
+                stance = "anti"
+            else:
+                stance = "neutral"
+
+        # 理性/感性判断（基于句式特征）
+        # 感性特征：感叹号、问号密集、表情符号、主观副词
+        emotion_keywords = [
+            "!", "！", "太", "真的", "居然", "竟然", "卧槽", "绝了",
+            "哈哈", "呜呜", "笑死", "气死", "离谱", "逆天",
+        ]
+        rational_keywords = [
+            "数据显示", "分析", "原因", "逻辑", "证据", "客观",
+            "实际上", "本质上", "总结", "综上所述",
+        ]
+        emo_count = sum(1 for e in emotion_keywords if e in text)
+        rat_count = sum(1 for r in rational_keywords if r in text)
+
+        exclamation_count = text.count("!") + text.count("！") + text.count("?") + text.count("？")
+        if exclamation_count >= 3:
+            emo_count += 1
+
+        if emo_count > rat_count:
+            emotion = "emotional"
+        elif rat_count > emo_count:
+            emotion = "rational"
+        else:
+            emotion = "neutral"
+
+        results.append({"stance": stance, "emotion": emotion})
+
+    return {"results": results}
+
+
+@router.post("/comment/huashu")
+async def comment_generate_huashu(body: dict):
+    """
+    DeepSeek 生成评论话术。
+    输入: {"comment_text": "...", "stance": "挺米", "style": "理性", "诉求": "..."}
+    输出: {"huashus": [{"text":"...", "effectiveness":85, "strategy":"..."}, ...]}
+    """
+    api_key = _get_deepseek_key()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先在账号管理中配置 DeepSeek API Key")
+
+    comment_text = body.get("comment_text", "")
+    stance = body.get("stance", "挺米")
+    style = body.get("style", "理性")
+    诉求 = body.get("诉求", "")
+
+    if not comment_text:
+        raise HTTPException(status_code=400, detail="请提供评论内容")
+
+    system_prompt = (
+        f"你是一个舆情应对专家。请针对以下评论生成3条回复话术。\n"
+        f"用户立场：{stance}\n"
+        f"话术风格：{style}\n"
+        f"用户诉求：{诉求}\n\n"
+        f"每条话术要求：\n"
+        f"- 话术正文50-200字\n"
+        f"- 必须符合{style}风格\n"
+        f"- 如果立场是'挺米'，话术应为米哈游辩护\n"
+        f"- 如果立场是'反米'，话术应批评米哈游\n"
+        f"- 话术应具体、有说服力，避免空泛\n\n"
+        f"请以JSON格式输出：\n"
+        f'{{"huashus": ['
+        f'  {{"text": "话术正文", "effectiveness": 85, "strategy": "数据反驳"}},'
+        f'  ...'
+        f']}}'
+    )
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            resp = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": comment_text},
+                    ],
+                    "max_tokens": 2000,
+                    "temperature": 0.7,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=50,
+            )
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        result = json.loads(content)
+        return {"ok": True, "huashus": result.get("huashus", [])}
+    except json.JSONDecodeError:
+        return {"ok": True, "huashus": [{"text": "生成失败，请重试", "effectiveness": 0, "strategy": "error"}]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"话术生成失败: {str(e)}")
+
+
+# ── Presets 持久化存储 ──
+
+def _load_comment_presets():
+    """从 DB 加载评论增强 presets"""
+    try:
+        db = SessionLocal()
+        acc = db.query(AccountModel).filter(AccountModel.platform == "comment_presets").first()
+        if acc and acc.username:
+            return json.loads(acc.username)
+    except:
+        pass
+    finally:
+        if "db" in locals():
+            db.close()
+    return {"style": "理性", "stance": "挺米", "诉求": ""}
+
+
+def _save_comment_presets(data: dict):
+    """保存评论增强 presets 到 DB"""
+    try:
+        db = SessionLocal()
+        acc = db.query(AccountModel).filter(AccountModel.platform == "comment_presets").first()
+        if acc:
+            acc.username = json.dumps(data, ensure_ascii=False)
+            acc.is_valid = True
+        else:
+            db.add(AccountModel(platform="comment_presets",
+                                username=json.dumps(data, ensure_ascii=False),
+                                cookie="", is_valid=True))
+        db.commit()
+    except:
+        pass
+    finally:
+        if "db" in locals():
+            db.close()
+
+
+@router.get("/comment/presets")
+async def comment_get_presets():
+    """获取已保存的评论增强 presets"""
+    return _load_comment_presets()
+
+
+@router.post("/comment/presets")
+async def comment_save_presets(body: dict):
+    """保存评论增强 presets（每次修改自动调用）"""
+    data = {
+        "style": body.get("style", "理性"),
+        "stance": body.get("stance", "挺米"),
+        "诉求": body.get("诉求", ""),
+    }
+    _save_comment_presets(data)
+    return {"ok": True, "presets": data}
