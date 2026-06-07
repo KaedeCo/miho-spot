@@ -195,6 +195,7 @@ class BackendGUI(QMainWindow):
     def _run_server(self):
         # When frozen, redirect ALL data to EXE-adjacent folder so it persists
         if getattr(sys, 'frozen', False):
+            import shutil as _shutil
             import app.models as _m
             base = Path(sys.executable).parent / "data"
             base.mkdir(parents=True, exist_ok=True)
@@ -207,6 +208,28 @@ class BackendGUI(QMainWindow):
             _m.SessionLocal = sessionmaker(bind=_m.engine)
             from app.api.routes import set_data_base_dir
             set_data_base_dir(str(base))
+
+            # Copy bundled seed data files (categories.json, hot_crawl.json, paper/)
+            # from _MEIPASS to external data dir so first-run has complete config
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                bundled_data = Path(meipass) / "app" / "data"
+                if bundled_data.exists():
+                    for fname in ["categories.json", "hot_crawl.json"]:
+                        src = bundled_data / fname
+                        dst = base / fname
+                        if src.exists() and not dst.exists():
+                            _shutil.copy2(str(src), str(dst))
+                            print(f"[Miho-spot] Seeded {fname} from bundle")
+                # Also copy bundled paper/ directory
+                bundled_paper = Path(meipass) / "app" / "paper"
+                dst_paper = base / "paper"
+                if bundled_paper.exists() and not dst_paper.exists():
+                    dst_paper.mkdir(parents=True, exist_ok=True)
+                    for pf in bundled_paper.glob("*.pdf"):
+                        if not (dst_paper / pf.name).exists():
+                            _shutil.copy2(str(pf), str(dst_paper / pf.name))
+                    print(f"[Miho-spot] Seeded paper/ from bundle")
 
         import uvicorn
         from fastapi import FastAPI
@@ -247,16 +270,30 @@ class BackendGUI(QMainWindow):
         app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
         app.include_router(ar)
 
-        # When frozen, serve the bundled frontend static build at root (/)
+        # When frozen, serve the bundled frontend static build
         if getattr(sys, 'frozen', False):
             from fastapi.staticfiles import StaticFiles
+            from fastapi.responses import FileResponse
             meipass = getattr(sys, '_MEIPASS', None)
             if meipass:
                 fe_dir = Path(meipass) / "frontend_dist"
             else:
                 fe_dir = Path(__file__).resolve().parent / "frontend_dist"
             if fe_dir.exists() and (fe_dir / "index.html").exists():
-                app.mount("/", StaticFiles(directory=str(fe_dir), html=True), name="frontend")
+                # Mount /assets/ subdirectory for JS/CSS/fonts
+                assets_dir = fe_dir / "assets"
+                if assets_dir.exists():
+                    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+                # SPA catch-all: serve index.html for all non-API paths
+                # (must be added AFTER all API routes — uvicorn calls run() after this block)
+                @app.get("/{catch_all:path}", include_in_schema=False)
+                async def serve_spa(catch_all: str):
+                    fp = fe_dir / catch_all
+                    if fp.is_file():
+                        return FileResponse(str(fp))
+                    return FileResponse(str(fe_dir / "index.html"))
+
                 print(f"[Miho-spot] Serving bundled frontend from {fe_dir}")
 
         uvicorn.run(app, host="0.0.0.0", port=self.port, log_level="warning")

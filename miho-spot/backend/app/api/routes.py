@@ -1629,31 +1629,48 @@ def _get_categories_path() -> Path:
         CATEGORIES_FILE = d / "categories.json"
     return CATEGORIES_FILE
 
+# Master default category list — single source of truth for all 14 categories
+_CATEGORY_DEFAULTS = {
+    "mihoyo_game":      {"name": "米哈游游戏",     "order": 1},
+    "mihoyo_character": {"name": "米哈游角色",     "order": 2},
+    "mihoyo_cv":        {"name": "米哈游CV",       "order": 3},
+    "competitor":       {"name": "竞品游戏",       "order": 4},
+    "general":          {"name": "二游圈通用",     "order": 5},
+    "sentiment_neg":    {"name": "负面情感词",     "order": 6},
+    "sentiment_pos":    {"name": "正面情感词",     "order": 7},
+    "platform":         {"name": "社区/平台术语",  "order": 8},
+    "game_mechanic":    {"name": "游戏系统/机制",  "order": 9},
+    "player_group":     {"name": "玩家群体/称呼",  "order": 10},
+    "meme":             {"name": "热梗/网络用语",  "order": 11},
+    "industry":         {"name": "行业/商业术语",  "order": 12},
+    "acg":              {"name": "二次元/ACG文化", "order": 13},
+    "bili_slang":       {"name": "B站/视频圈用语", "order": 14},
+}
+
 def _load_categories() -> dict:
     path = _get_categories_path()
     if not path.exists():
-        defaults = {"categories": {
-            "mihoyo_game": {"name": "米哈游游戏", "order": 1},
-            "mihoyo_character": {"name": "米哈游角色", "order": 2},
-            "mihoyo_cv": {"name": "米哈游CV", "order": 3},
-            "competitor": {"name": "竞品游戏", "order": 4},
-            "general": {"name": "二游圈通用", "order": 5},
-            "sentiment_neg": {"name": "负面情感词", "order": 6},
-            "sentiment_pos": {"name": "正面情感词", "order": 7},
-            "platform": {"name": "社区/平台术语", "order": 8},
-            "game_mechanic": {"name": "游戏系统/机制", "order": 9},
-            "player_group": {"name": "玩家群体/称呼", "order": 10},
-            "meme": {"name": "热梗/网络用语", "order": 11},
-            "industry": {"name": "行业/商业术语", "order": 12},
-            "acg": {"name": "二次元/ACG文化", "order": 13},
-            "bili_slang": {"name": "B站/视频圈用语", "order": 14},
-        }}
+        defaults = {"categories": dict(_CATEGORY_DEFAULTS)}
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(defaults, f, ensure_ascii=False, indent=2)
         return defaults
+
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+
+    # Merge any missing default categories into existing file (handles upgrades)
+    cats = data.get("categories", {})
+    changed = False
+    for key, val in _CATEGORY_DEFAULTS.items():
+        if key not in cats:
+            cats[key] = dict(val)
+            changed = True
+    if changed:
+        data["categories"] = cats
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    return data
 
 def _save_categories(data: dict):
     path = _get_categories_path()
@@ -2434,12 +2451,15 @@ def _bili_get_aid(bvid: str) -> tuple:
 
 
 def _get_bilibili_cookie() -> str:
-    """Read user-configured B站 cookie from accounts table. Returns '' if none."""
+    """Read user-configured B站 cookie from accounts table. Returns '' if none.
+    NOTE: does NOT require is_valid — cookie may work even without explicit verification."""
     try:
         db = SessionLocal()
         try:
             acct = db.query(AccountModel).filter(AccountModel.platform == "bilibili").first()
-            if acct and acct.is_valid and acct.cookie:
+            if acct and acct.cookie:
+                if not acct.is_valid:
+                    print("[Video-Fetch:COOKIE] Cookie configured but not verified yet, trying anyway...")
                 return acct.cookie.strip()
         finally:
             db.close()
@@ -2465,7 +2485,9 @@ def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500, *, use_u
     channel = "unknown"
 
     # ── Attempt 1: User Cookie + Official API ──
-    if cookie:
+    if not cookie:
+        print("[Video-Fetch:COOKIE] No B站 Cookie configured — go to 账号管理 → 添加B站Cookie to unlock full comments")
+    else:
         try:
             from curl_cffi import requests as cffi_requests
             _use_cffi = True
@@ -2593,9 +2615,9 @@ def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500, *, use_u
         except Exception as e:
             print(f"[Video-Fetch:UAPIS] Failed: {e}, falling back to direct API")
 
-    # ── Attempt 3: Direct official API (last resort, likely blocked) ──
+    # ── Attempt 3: Direct official API (last resort, may hit -352) ──
     channel = "direct"
-    print("[Video-Fetch:DIRECT] Trying direct B站 API (may fail with -352)...")
+    print("[Video-Fetch:DIRECT] Trying direct B站 API (no cookie, may hit rate-limit)...")
     try:
         from curl_cffi import requests as cffi_requests
         _use_cffi2 = True
@@ -2640,8 +2662,11 @@ def _bili_fetch_comments(aid: int, mode: int = 3, max_count: int = 500, *, use_u
             print(f"[Video-Fetch:DIRECT] Page {page} error ({code}): {d.get('message', '')}")
             if code == -352:
                 consecutive_352 += 1
-                if consecutive_352 >= 5: break
-                _time.sleep(min(consecutive_352 * 3, 30))
+                if consecutive_352 >= 12:  # more retries for EXE environment
+                    print("[Video-Fetch:DIRECT] Too many -352 errors, giving up. Please configure B站 Cookie for full access.")
+                    break
+                wait = min(consecutive_352 * 2 + _random.uniform(0.5, 2.5), 45)
+                _time.sleep(wait)
                 continue
             break
         consecutive_352 = 0
@@ -5097,7 +5122,11 @@ async def debate_delete_session(session_id: str):
 @router.get("/comment/script")
 async def comment_download_script():
     """下载定制的 B站评论增强油猴脚本（默认值从 DB 历史 preset 读取）"""
-    template_path = Path(__file__).resolve().parent.parent / "debate" / "comment_script_template.js"
+    import sys as _sys
+    if getattr(_sys, 'frozen', False):
+        template_path = Path(_sys._MEIPASS) / "app" / "debate" / "comment_script_template.js"
+    else:
+        template_path = Path(__file__).resolve().parent.parent / "debate" / "comment_script_template.js"
     if not template_path.exists():
         raise HTTPException(status_code=500, detail="脚本模板文件不存在")
     # 如果前端没传参数，用 DB 保存的历史 preset 作为默认值

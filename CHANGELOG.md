@@ -1,5 +1,42 @@
 # Miho-spot Changelog
 
+## [v1.6.1] — 2026-06-07
+
+### 桌面完整打包版 — 一键 EXE 运行
+
+v1.6.1 是一次全面的打包修复版本，解决了 PyInstaller 单文件 EXE 中多项功能缺失问题。
+
+#### 打包系统修复 (6 项)
+
+- **前端 dist 过期**：使用最新源码（6/5）重新构建前端，侧边栏 14 个菜单项全部可见（v1.6 发布时打包的是 6/3 旧版 dist）
+- **SPA 路由修复**：`StaticFiles(html=True)` 无法处理 SPA 路径（如 `/opinion-timeline`），改为 catch-all 路由 + `/assets` 独立挂载
+- **首次启动种子数据**：EXE 启动时从 `_MEIPASS` 自动复制 `categories.json`、`hot_crawl.json`、`paper/` 到外部 `data/` 目录
+- **分类自动合并**：`_load_categories()` 新增合并逻辑——读取已有文件后用 `_CATEGORY_DEFAULTS` 逐项补全，升级旧文件不丢失用户自定义分类
+- **油猴脚本导出**：JS 模板文件 `comment_script_template.js` 通过 `--add-data` 打入 EXE，`routes.py` 使用 `sys._MEIPASS` 解析路径
+- **缺失依赖补全**：reportlab、matplotlib、numpy、scipy、wordcloud、duckduckgo_search/ddgs、PIL 全部通过 `--collect-all` 打包
+
+#### B站视频分析修复 (3 项)
+
+- **Cookie 策略**：`_get_bilibili_cookie()` 不再要求 `is_valid=True`，有 SESSDATA 即可使用
+- **无 Cookie 兜底**：DIRECT 模式 `-352` 重试从 5 次 → 12 次，延迟增加 0.5-2.5s 随机 jitter，上限 45s
+- **明确日志提示**：无 Cookie 时打印 "请到账号管理添加B站Cookie"
+
+#### PDF 报告修复 (1 项)
+
+- **时间轴推演章节截断**：`module_trail()` 中 AI 分析文本从单个 `Paragraph` 拆分为按 `\n\n` 分隔的多个小 flowable，避免页面边界硬截断
+
+#### Bug修复总结
+
+- 前端 dist 时间戳（6/3 vs 6/5 源码）→ 重新构建
+- SPA 路由 404（StaticFiles 不支持）→ catch-all 路由
+- 打包版缺少功能（PDF/词云/辩论/图表）→ 完整依赖打包
+- B站评论只拉 6 条 → Cookie 策略 + -352 重试修复
+- 油猴脚本导出 500 → JS 模板打包 + 路径修复
+- PDF 末尾半句截断 → 多 Paragraph 拆分
+- 分类不全（7 个 vs 14 个）→ 分类合并逻辑
+
+---
+
 ## [v1.5.0] — 2026-06-06
 
 ### 多Agent瑞士轮辩论厅

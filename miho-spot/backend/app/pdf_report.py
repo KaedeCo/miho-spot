@@ -695,7 +695,20 @@ def module_trail(story, saved_ot, db, ch_num: str, ds_api_key=None, progress_cb=
                         f"评论：\n{ct}\n\n100字分析舆论转向原因。直接输出。",
                         ds_api_key, max_tokens=200, temperature=0.5, timeout=60)
                     if a:
-                        story.append(Paragraph(_en_tnr(f"<b>AI分析：</b>{_md_to_html(a)}"), BODY_NO_INDENT))
+                        # Split into shorter paragraphs to avoid ReportLab
+                        # truncation at page boundaries (single Paragraph
+                        # flowable cannot span pages reliably for long text)
+                        html_text = _en_tnr(f"<b>AI分析：</b>{_md_to_html(a)}")
+                        paragraphs = html_text.split("\n\n")
+                        for i, para in enumerate(paragraphs):
+                            para = para.strip()
+                            if para:
+                                # Small spacer between paragraph chunks (none before first)
+                                if i == 0:
+                                    story.append(Paragraph(para, BODY_NO_INDENT))
+                                else:
+                                    story.append(Spacer(1, 4))
+                                    story.append(Paragraph(para, BODY_STYLE))
                 except:
                     story.append(Paragraph("（AI分析暂不可用）", SMALL_STYLE))
             else:
